@@ -1,0 +1,12 @@
+#!/usr/bin/env nix
+#! nix shell nixpkgs#python3Packages.soco --command python3
+
+# This script uses the SoCo library to control a Sonos speaker.
+
+from soco import SoCo
+
+speaker = SoCo("192.168.1.50")
+speaker.play_uri("http://myhost/red.mp3")
+
+# speaker.set_relative_volume(10)  # Increase volume by 10%
+# speaker.set_relative_volume(-5)  # Increase volume by 10%
