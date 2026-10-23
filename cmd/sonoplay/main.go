@@ -8,6 +8,8 @@
 //	sonoplay mute        [--ip <ip>]
 //	sonoplay unmute      [--ip <ip>]
 //	sonoplay toggle      [--ip <ip>]
+//	sonoplay list        [--ip <ip>]
+//	sonoplay remove      [--ip <ip>] <selector> [<selector> ...]
 //
 // For backward compatibility, if the first argument isn't a known
 // subcommand, it's treated as `play <args...>`, e.g.:
@@ -71,6 +73,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -366,6 +369,16 @@ func addURIToQueue(ip, uri string, asNext bool) (firstTrackNumberEnqueued, newQu
 	return parsed.Body.Resp.FirstTrackNumberEnqueued, parsed.Body.Resp.NewQueueLength, nil
 }
 
+// removeTrackRangeFromQueue removes numberOfTracks tracks from the queue,
+// starting at the given 1-based startingIndex (inclusive).
+func removeTrackRangeFromQueue(ip string, startingIndex, numberOfTracks int) error {
+	body := fmt.Sprintf(`<InstanceID>0</InstanceID>
+      <UpdateID></UpdateID>
+      <StartingIndex>%d</StartingIndex>
+      <NumberOfTracks>%d</NumberOfTracks>`, startingIndex, numberOfTracks)
+	return avTransportCall(ip, "RemoveTrackRangeFromQueue", body)
+}
+
 // getUDN fetches the speaker's device description and returns its UDN
 // (without the "uuid:" prefix), needed to address its play queue.
 func getUDN(ip string) (string, error) {
@@ -448,6 +461,54 @@ func isPositiveInteger(s string) bool {
 		}
 	}
 	return true
+}
+
+// parseTrackRange parses a single remove-command selector into an
+// inclusive [start, end] range of 1-based queue positions. Accepted forms:
+//
+//	"5"      a single position
+//	"1-9"    an inclusive range
+//	"1..9"   same, alternate syntax
+//	"9-"     from 9 to the end of the queue (maxIndex)
+func parseTrackRange(selector string, maxIndex int) (start, end int, err error) {
+	switch {
+	case strings.Contains(selector, ".."):
+		startStr, endStr, _ := strings.Cut(selector, "..")
+		start, err = strconv.Atoi(strings.TrimSpace(startStr))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid start %q", startStr)
+		}
+		end, err = strconv.Atoi(strings.TrimSpace(endStr))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid end %q", endStr)
+		}
+		return start, end, nil
+
+	case strings.Contains(selector, "-"):
+		startStr, endStr, _ := strings.Cut(selector, "-")
+		start, err = strconv.Atoi(strings.TrimSpace(startStr))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid start %q", startStr)
+		}
+		endStr = strings.TrimSpace(endStr)
+		if endStr == "" {
+			// Open-ended range, e.g. "9-": run to the end of the queue.
+			end = maxIndex
+		} else {
+			end, err = strconv.Atoi(endStr)
+			if err != nil {
+				return 0, 0, fmt.Errorf("invalid end %q", endStr)
+			}
+		}
+		return start, end, nil
+
+	default:
+		n, err := strconv.Atoi(strings.TrimSpace(selector))
+		if err != nil {
+			return 0, 0, fmt.Errorf("not a number, range (A-B, A..B), or open range (A-)")
+		}
+		return n, n, nil
+	}
 }
 
 // queueTrack is one entry returned by browseQueue.
@@ -1216,6 +1277,101 @@ func runList(args []string) {
 	}
 }
 
+func runRemove(args []string) {
+	fs := flag.NewFlagSet("remove", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s remove [--ip <speaker-ip>] <selector> [<selector> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nRemoves one or more tracks from the current play queue. Positions are\n")
+		fmt.Fprintf(os.Stderr, "1-based, matching '%s list' output.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nEach <selector> is one of:\n")
+		fmt.Fprintf(os.Stderr, "  N      a single queue position, e.g. \"5\"\n")
+		fmt.Fprintf(os.Stderr, "  A-B    an inclusive range, e.g. \"1-9\"\n")
+		fmt.Fprintf(os.Stderr, "  A..B   same as A-B, e.g. \"1..9\"\n")
+		fmt.Fprintf(os.Stderr, "  A-     from A to the end of the queue, e.g. \"9-\"\n")
+		fmt.Fprintf(os.Stderr, "\nMultiple selectors may be given at once, e.g.:\n")
+		fmt.Fprintf(os.Stderr, "  %s remove 1 5 9\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s remove 1-9\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
+		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n\n")
+		fs.PrintDefaults()
+	}
+
+	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	fs.Parse(args)
+
+	requireIP(fs, *ip)
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	tracks, total, err := browseQueue(*ip, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	if total == 0 {
+		fmt.Fprintln(os.Stderr, "error: queue is empty")
+		os.Exit(1)
+	}
+
+	selected := map[int]bool{}
+	for _, arg := range fs.Args() {
+		start, end, err := parseTrackRange(arg, total)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid selector %q: %v\n", arg, err)
+			os.Exit(2)
+		}
+		if start < 1 || end > total || start > end {
+			fmt.Fprintf(os.Stderr, "error: selector %q is out of range (queue has %d track(s))\n", arg, total)
+			os.Exit(2)
+		}
+		for i := start; i <= end; i++ {
+			selected[i] = true
+		}
+	}
+
+	indices := make([]int, 0, len(selected))
+	for i := range selected {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+
+	// Show what's about to be removed before touching the queue.
+	for _, i := range indices {
+		fmt.Printf("removing %3d. %s\n", i, formatTrack(tracks[i-1]))
+	}
+
+	// Group the sorted, 1-based indices into maximal contiguous ranges, so
+	// each range can be removed with a single RemoveTrackRangeFromQueue
+	// call instead of one call per track.
+	type trackRange struct{ start, count int }
+	var ranges []trackRange
+	for _, i := range indices {
+		if n := len(ranges); n > 0 && ranges[n-1].start+ranges[n-1].count == i {
+			ranges[n-1].count++
+		} else {
+			ranges = append(ranges, trackRange{start: i, count: 1})
+		}
+	}
+
+	// Remove ranges from highest starting index to lowest: removing a
+	// higher range doesn't shift the position of lower, not-yet-removed
+	// tracks, so later calls in the loop still target the right indices.
+	removed := 0
+	for j := len(ranges) - 1; j >= 0; j-- {
+		r := ranges[j]
+		if err := removeTrackRangeFromQueue(*ip, r.start, r.count); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		removed += r.count
+	}
+
+	fmt.Printf("removed %d track(s)\n", removed)
+}
+
 // nowPlayingLine renders the "▶ Title [elapsed/duration]" line used when
 // the currently playing track has no corresponding queue row to mark.
 func nowPlayingLine(t queueTrack, pos positionInfo) string {
@@ -1360,6 +1516,7 @@ func printTopUsage() {
 		{"mute-on", "mute the speaker"},
 		{"mute-off", "unmute the speaker"},
 		{"list, ls", "list the current play queue"},
+		{"remove, rm", "remove tracks from the play queue (e.g. \"rm 1 5 9\", \"rm 1-9\")"},
 		{"status", "show transport state, volume, and now playing"},
 		{"next", "skip to the next track"},
 		{"prev, previous", "skip to the previous track"},
@@ -1400,6 +1557,8 @@ func main() {
 		runMute(os.Args[1], os.Args[2:], "toggle")
 	case "list", "ls":
 		runList(os.Args[2:])
+	case "remove", "rm":
+		runRemove(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	case "next":
