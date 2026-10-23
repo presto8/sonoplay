@@ -1199,6 +1199,73 @@ func runMute(name string, args []string, action string) {
 	}
 }
 
+// terminalMargin is how much vertical space runList leaves unused below
+// its output when truncating to fit the terminal, so the result doesn't
+// run flush against the bottom of the screen (e.g. a shell prompt below
+// it). On top of this fixed margin, a further 10% of the detected window
+// height is reserved (see terminalSafetyMargin) to absorb any discrepancy
+// between the reported size and what's actually visible/usable (wrapped
+// prompts, tmux/multiplexer chrome, off-by-a-bit terminal reporting, etc).
+const terminalMargin = 2
+
+// terminalSafetyMargin returns an additional safety margin equal to ~10%
+// of rows (rounded up, at least 1), reserved on top of terminalMargin.
+func terminalSafetyMargin(rows int) int {
+	return (rows + 9) / 10
+}
+
+// visibleWindow picks which [start, end) slice of a 0..total list to show
+// given a budget of maxLines printed rows, keeping anchor (e.g. the
+// currently-playing track's index, or -1 if there is none) visible.
+// topEllipsis/bottomEllipsis report whether a "..." row is needed above
+// and/or below the window to indicate hidden items.
+//
+// If everything fits (total <= maxLines), or maxLines is too small to
+// usefully truncate (less than one row for an item plus both ellipsis
+// rows), the whole list is returned untruncated.
+func visibleWindow(total, anchor, maxLines int) (start, end int, topEllipsis, bottomEllipsis bool) {
+	if maxLines < 3 || total <= maxLines {
+		return 0, total, false, false
+	}
+	if anchor < 0 {
+		anchor = 0
+	}
+
+	// Anchor falls within the first maxLines-1 items: show from the top,
+	// with just a bottom ellipsis for the rest.
+	if anchor < maxLines-1 {
+		end = maxLines - 1
+		if end > total {
+			end = total
+		}
+		return 0, end, false, true
+	}
+
+	// Anchor falls within the last maxLines-1 items: show through the
+	// end, with just a top ellipsis for the rest.
+	if anchor >= total-(maxLines-1) {
+		start = total - (maxLines - 1)
+		if start < 0 {
+			start = 0
+		}
+		return start, total, true, false
+	}
+
+	// Anchor is in the middle: center the window on it, with an ellipsis
+	// on both sides.
+	inner := maxLines - 2
+	start = anchor - inner/2
+	end = start + inner
+	if start < 1 {
+		start, end = 1, 1+inner
+	}
+	if end > total-1 {
+		end = total - 1
+		start = end - inner
+	}
+	return start, end, true, true
+}
+
 func runList(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	fs.Usage = func() {
@@ -1262,11 +1329,30 @@ func runList(args []string) {
 
 	// Playing something that isn't part of the queue (e.g. a one-off URL)?
 	// There's no row to attach the marker to, so call it out separately.
+	extraLines := 0
 	if havePos && matched == -1 && nowPlaying.URI != "" {
 		fmt.Println(nowPlayingLine(nowPlaying, pos) + "  (not queued)")
+		extraLines++
 	}
 
-	for i, t := range tracks {
+	// If stdin is a console and we can determine its size, truncate the
+	// list to fit the screen (leaving a little room to spare), rather
+	// than dumping potentially hundreds of lines. The ellipsis rows below
+	// mark whichever ends got cut off.
+	maxLines := len(tracks)
+	if _, rows, ok := terminalSize(os.Stdin.Fd()); ok {
+		if budget := rows - terminalMargin - terminalSafetyMargin(rows) - extraLines; budget < maxLines {
+			maxLines = budget
+		}
+	}
+
+	start, end, topEllipsis, bottomEllipsis := visibleWindow(len(tracks), matched, maxLines)
+
+	if topEllipsis {
+		fmt.Printf("... %d before\n", start)
+	}
+	for i := start; i < end; i++ {
+		t := tracks[i]
 		marker := "  "
 		suffix := ""
 		if i == matched {
@@ -1274,6 +1360,9 @@ func runList(args []string) {
 			suffix = nowPlayingSuffix(pos)
 		}
 		fmt.Printf("%s%3d. %s%s\n", marker, i+1, formatTrack(t), suffix)
+	}
+	if bottomEllipsis {
+		fmt.Printf("... %d more\n", len(tracks)-end)
 	}
 }
 
