@@ -1532,13 +1532,13 @@ func runStatus(args []string) {
 	}
 }
 
-// runSkip handles "next" and "prev"/"previous": it skips to the next or
-// previous track, then prints what's now playing (best-effort).
+// runSkip handles "next"/"n" and "prev"/"previous"/"p": it skips to the
+// next or previous track, then prints what's now playing (best-effort).
 func runSkip(name string, args []string, skip func(ip string) error) {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	fs.Usage = func() {
 		verb := "next"
-		if name == "prev" || name == "previous" {
+		if name == "prev" || name == "previous" || name == "p" {
 			verb = "previous"
 		}
 		fmt.Fprintf(os.Stderr, "usage: %s %s [--ip <speaker-ip>]\n", os.Args[0], name)
@@ -1607,8 +1607,8 @@ func printTopUsage() {
 		{"list, ls", "list the current play queue"},
 		{"remove, rm", "remove tracks from the play queue (e.g. \"rm 1 5 9\", \"rm 1-9\")"},
 		{"status", "show transport state, volume, and now playing"},
-		{"next", "skip to the next track"},
-		{"prev, previous", "skip to the previous track"},
+		{"next, n", "skip to the next track"},
+		{"prev, previous, p", "skip to the previous track"},
 		{"stop", "stop playback"},
 	} {
 		fmt.Fprintf(os.Stderr, "  %-26s %s\n", c[0], c[1])
@@ -1650,9 +1650,9 @@ func main() {
 		runRemove(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
-	case "next":
+	case "next", "n":
 		runSkip(os.Args[1], os.Args[2:], nextTrack)
-	case "prev", "previous":
+	case "prev", "previous", "p":
 		runSkip(os.Args[1], os.Args[2:], previousTrack)
 	case "stop":
 		runStop(os.Args[2:])
