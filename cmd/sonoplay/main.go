@@ -37,10 +37,23 @@
 //     dest_dir = /srv/www/sonos
 //     step = 2
 //
+// Playing a Spotify share link (see below) additionally needs
+// spotify_account and spotify_sn (or SONOS_SPOTIFY_ACCOUNT/SONOS_SPOTIFY_SN),
+// but only if sonoplay can't auto-detect them (see discoverSpotifyAccount).
+//
 // For `play`: the file to play is normally just a name (e.g. "red.mp3"),
 // which gets appended to the base URL, e.g. "http://myhost/". A full URL
 // (containing "://") can still be passed directly, bypassing the base URL
 // entirely.
+//
+// A Spotify share link (e.g. "https://open.spotify.com/track/...") or
+// spotify: URI (e.g. "spotify:album:...") is recognized and queued
+// directly on the speaker; this is independent of --base-url/--dest-dir.
+// Track, album, playlist, episode, show, and artist (radio) links are
+// supported. NOTE: as of this writing, current Sonos S2 firmware rejects
+// third-party/non-Sonos-app playback of linked streaming-service content
+// outright (UPnP error 800), so this may not work regardless of setup;
+// see https://github.com/SoCo/SoCo/issues/969.
 //
 // If dest-dir is set and the argument is a local file path (not a full
 // URL), the file is first copied into that directory before the base-url +
@@ -73,6 +86,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -90,6 +104,13 @@ const (
 	// AVTransport and RenderingControl.
 	contentDirectoryControlPath = "/MediaServer/ContentDirectory/Control"
 	contentDirectoryServiceType = "urn:schemas-upnp-org:service:ContentDirectory:1"
+
+	// MusicServices lives at the top level (not under /MediaRenderer or
+	// /MediaServer). We only use it to look up which music-service
+	// "types" (see spotifyServiceTypeCandidates) are available on the
+	// household, to build correct Spotify share-link metadata.
+	musicServicesControlPath = "/MusicServices/Control"
+	musicServicesServiceType = "urn:schemas-upnp-org:service:MusicServices:1"
 )
 
 // appConfig holds options loaded from the config file. Zero values mean
@@ -99,6 +120,14 @@ type appConfig struct {
 	BaseURL string
 	DestDir string
 	Step    string
+
+	// SpotifyAccount and SpotifySN override auto-detection of the
+	// Sonos-internal Spotify account identifiers needed to play Spotify
+	// share links (see discoverSpotifyAccount). Only needed if
+	// auto-detection fails (e.g. no Spotify item has ever been saved to
+	// Sonos Favorites or played on this system).
+	SpotifyAccount string
+	SpotifySN      string
 }
 
 // cfg is populated once at startup from the config file, then used as a
@@ -155,6 +184,8 @@ func loadConfig() (appConfig, error) {
 	cfg.BaseURL = values["base_url"]
 	cfg.DestDir = values["dest_dir"]
 	cfg.Step = values["step"]
+	cfg.SpotifyAccount = values["spotify_account"]
+	cfg.SpotifySN = values["spotify_sn"]
 	return cfg, nil
 }
 
@@ -221,6 +252,10 @@ func renderingControlCall(ip, action, body string) ([]byte, error) {
 
 func contentDirectoryCall(ip, action, body string) ([]byte, error) {
 	return soapRequest(ip, contentDirectoryControlPath, contentDirectoryServiceType, action, body)
+}
+
+func musicServicesCall(ip, action, body string) ([]byte, error) {
+	return soapRequest(ip, musicServicesControlPath, musicServicesServiceType, action, body)
 }
 
 // xmlEscape escapes s for safe embedding as XML character data (e.g. in a
@@ -340,15 +375,22 @@ func playURI(ip, uri string) error {
 // current track) uri to the speaker's play queue, returning the 1-based
 // position it landed at and the resulting queue length.
 func addURIToQueue(ip, uri string, asNext bool) (firstTrackNumberEnqueued, newQueueLength int, err error) {
+	return addURIToQueueWithMetadata(ip, uri, "", asNext)
+}
+
+// addURIToQueueWithMetadata is like addURIToQueue, but also lets the
+// caller supply DIDL-Lite metadata for the enqueued URI (needed for
+// music-service share links, e.g. Spotify; see resolveSpotifyItem).
+func addURIToQueueWithMetadata(ip, uri, metadata string, asNext bool) (firstTrackNumberEnqueued, newQueueLength int, err error) {
 	next := 0
 	if asNext {
 		next = 1
 	}
 	body := fmt.Sprintf(`<InstanceID>0</InstanceID>
       <EnqueuedURI>%s</EnqueuedURI>
-      <EnqueuedURIMetaData></EnqueuedURIMetaData>
+      <EnqueuedURIMetaData>%s</EnqueuedURIMetaData>
       <DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued>
-      <EnqueueAsNext>%d</EnqueueAsNext>`, xmlEscape(uri), next)
+      <EnqueueAsNext>%d</EnqueueAsNext>`, xmlEscape(uri), xmlEscape(metadata), next)
 
 	respBody, err := avTransportCallWithResponse(ip, "AddURIToQueue", body)
 	if err != nil {
@@ -949,6 +991,356 @@ func warnIfUnsupportedFormat(uriOrPath string) {
 	fmt.Fprintf(os.Stderr, "warning: %q has an unrecognized file extension; Sonos may not be able to play it\n", filepath.Base(p))
 }
 
+// playItem is a fully-resolved thing to send to the speaker, either a
+// plain audio URI (Metadata == "") or a music-service share link (e.g.
+// Spotify) that needs DIDL-Lite metadata alongside it so the speaker
+// knows which linked service account to play it with.
+type playItem struct {
+	URI string
+
+	// Metadata, if non-empty, is the DIDL-Lite XML to send as
+	// EnqueuedURIMetaData/CurrentURIMetaData alongside URI.
+	Metadata string
+
+	// Label, if set, is used in place of URI in user-facing messages.
+	Label string
+}
+
+// label returns a human-friendly description of the item for messages.
+func (it playItem) label() string {
+	if it.Label != "" {
+		return it.Label
+	}
+	return it.URI
+}
+
+// addItemToQueue adds item to the play queue.
+func addItemToQueue(ip string, item playItem, asNext bool) (firstTrackNumberEnqueued, newQueueLength int, err error) {
+	firstTrackNumberEnqueued, newQueueLength, err = addURIToQueueWithMetadata(ip, item.URI, item.Metadata, asNext)
+	if err != nil && item.Metadata != "" {
+		// item.Metadata non-empty means this is a music-service share
+		// link (currently only Spotify). A UPnP error 800 here is a
+		// known Sonos firmware restriction (not something sonoplay can
+		// construct its way around): confirmed on a real Sonos One
+		// (S2, 83.1-61240) by replaying the exact URI/metadata from a
+		// Sonos-app-created Favorite for the same item, which was
+		// rejected identically. Third-party/raw UPnP control of linked
+		// streaming-service content requires an authenticated cloud
+		// session that only the Sonos app itself has; see
+		// https://github.com/SoCo/SoCo/issues/969 (one report says a
+		// later Sonos software update resolved it for them, so it may
+		// be worth checking for a system update).
+		if strings.Contains(err.Error(), "errorCode>800<") {
+			err = fmt.Errorf("%w (Sonos firmware is rejecting third-party playback of linked streaming-service content; this isn't a sonoplay bug or a missing service link - see https://github.com/SoCo/SoCo/issues/969. Try checking for a Sonos system update)", err)
+		} else {
+			err = fmt.Errorf("%w (is this service linked under Settings > Services & Voice in the Sonos app? casting via Spotify Connect alone isn't enough)", err)
+		}
+	}
+	return firstTrackNumberEnqueued, newQueueLength, err
+}
+
+// spotifyShareRe recognizes Spotify URLs (open.spotify.com, with an
+// optional "intl-xx" locale path segment) and spotify:-scheme URIs,
+// capturing the share type and ID, e.g. "album", "6JvmSy...".
+var spotifyShareRe = regexp.MustCompile(`(?i)spotify(?:\.com)?(?:/intl-[a-z0-9-]+)?[:/](track|album|playlist|episode|show|artist)[:/]([A-Za-z0-9]+)`)
+
+// spotifyShareMagic describes how to build an AddURIToQueue request for a
+// given Spotify share type, matching what the Sonos app itself sends
+// (confirmed against a Sonos-saved Favorite's DIDL-Lite on a real
+// speaker: "artist" share links produce a playlistContainer with the
+// 1006206c prefix/key, used here for "radio" playback of that artist).
+type spotifyShareMagic struct {
+	prefix string
+	key    string
+	class  string
+}
+
+var spotifyShareMagicByType = map[string]spotifyShareMagic{
+	"track":    {prefix: "", key: "00032020", class: "object.item.audioItem.musicTrack"},
+	"episode":  {prefix: "", key: "00032020", class: "object.item.audioItem.musicTrack"},
+	"album":    {prefix: "x-rincon-cpcontainer:1004206c", key: "00040000", class: "object.container.album.musicAlbum"},
+	"playlist": {prefix: "x-rincon-cpcontainer:1006206c", key: "1006206c", class: "object.container.playlistContainer"},
+	"show":     {prefix: "x-rincon-cpcontainer:1006206c", key: "1006206c", class: "object.container.playlistContainer"},
+	"artist":   {prefix: "x-rincon-cpcontainer:1006206c", key: "1006206c", class: "object.container.playlistContainer"},
+}
+
+// spotifyTrackURIFlags and spotifyContainerURIFlags are the "flags="
+// values Sonos uses in the query string of Spotify share-link URIs. They
+// encode generic container/track capabilities and are the same across
+// households; only sid/sn (see spotifyAccount) are household-specific.
+const (
+	spotifyTrackURIFlags     = 32
+	spotifyContainerURIFlags = 8300
+)
+
+// spotifyMetadataTemplate is the DIDL-Lite metadata Sonos expects
+// alongside a Spotify share-link URI. The "desc" element's token tells
+// the speaker which linked service account to use; see spotifyAccount.
+const spotifyMetadataTemplate = `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="%s" parentID="-1" restricted="true"><dc:title></dc:title><upnp:class>%s</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">%s</desc></item></DIDL-Lite>`
+
+// parseSpotifyShareLink recognizes a Spotify share URL or spotify: URI
+// and extracts its share type ("track", "album", etc.) and ID.
+//
+// If arg has a "highlight" query parameter referencing a specific track
+// (as seen on links like ".../album/<id>?highlight=spotify:track:<id>",
+// generated when sharing a single track from within an album view),
+// that's preferred over the URL's own path, since it's almost always the
+// user's actual intent.
+func parseSpotifyShareLink(arg string) (shareType, id string, ok bool) {
+	if u, err := url.Parse(arg); err == nil {
+		if highlight := u.Query().Get("highlight"); highlight != "" {
+			if m := spotifyShareRe.FindStringSubmatch(highlight); m != nil {
+				return strings.ToLower(m[1]), m[2], true
+			}
+		}
+	}
+	if m := spotifyShareRe.FindStringSubmatch(arg); m != nil {
+		return strings.ToLower(m[1]), m[2], true
+	}
+	return "", "", false
+}
+
+// spotifyEncodeURI returns "spotify:<shareType>:<id>" with ":" replaced
+// by "%3A" (uppercase, matching what the Sonos app itself generates).
+func spotifyEncodeURI(shareType, id string) string {
+	return strings.ReplaceAll(fmt.Sprintf("spotify:%s:%s", shareType, id), ":", "%3A")
+}
+
+// musicService is one entry from MusicServices.ListAvailableServices:
+// a household-specific "sid" plus the fixed, region-dependent "service
+// type" number embedded in DIDL-Lite "desc" tokens for that service.
+type musicService struct {
+	ID          int // household-specific service id (the "sid" query param)
+	Name        string
+	ServiceType int // fixed catalog/region number used in "SA_RINCON<n>" desc tokens
+}
+
+// listMusicServices returns the household's available music services,
+// with each one's "service type" number resolved.
+//
+// MusicServices.ListAvailableServices returns two parallel lists: a
+// descriptor list (one <Service> per service, with its household-
+// specific "sid") and a flat, comma-separated AvailableServiceTypeList
+// of "service type" numbers. The two are positionally aligned, except
+// that ContainerType="Preload" entries (e.g. "Sonos Backgrounds") have
+// no corresponding entry in the type list and must be skipped; this was
+// confirmed empirically against a real Sonos speaker (108 services, 107
+// types, with exactly one Preload entry).
+func listMusicServices(ip string) ([]musicService, error) {
+	respBody, err := musicServicesCall(ip, "ListAvailableServices", "")
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		Body struct {
+			Resp struct {
+				AvailableServiceDescriptorList string `xml:"AvailableServiceDescriptorList"`
+				AvailableServiceTypeList       string `xml:"AvailableServiceTypeList"`
+			} `xml:"ListAvailableServicesResponse"`
+		} `xml:"Body"`
+	}
+	if err := xml.Unmarshal(respBody, &parsed); err != nil {
+		return nil, fmt.Errorf("parse ListAvailableServices response: %w", err)
+	}
+
+	var descriptors struct {
+		Services []struct {
+			ID            int    `xml:"Id,attr"`
+			Name          string `xml:"Name,attr"`
+			ContainerType string `xml:"ContainerType,attr"`
+		} `xml:"Service"`
+	}
+	if err := xml.Unmarshal([]byte(parsed.Body.Resp.AvailableServiceDescriptorList), &descriptors); err != nil {
+		return nil, fmt.Errorf("parse AvailableServiceDescriptorList: %w", err)
+	}
+
+	var types []int
+	for _, s := range strings.Split(parsed.Body.Resp.AvailableServiceTypeList, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(s); err == nil {
+			types = append(types, n)
+		}
+	}
+
+	services := make([]musicService, 0, len(descriptors.Services))
+	typeIdx := 0
+	for _, s := range descriptors.Services {
+		if s.ContainerType == "Preload" {
+			continue // no corresponding AvailableServiceTypeList entry
+		}
+		svc := musicService{ID: s.ID, Name: s.Name}
+		if typeIdx < len(types) {
+			svc.ServiceType = types[typeIdx]
+		}
+		typeIdx++
+		services = append(services, svc)
+	}
+	return services, nil
+}
+
+// browseRaw runs a ContentDirectory Browse and returns the raw,
+// unescaped DIDL-Lite XML from the response's <Result>.
+func browseRaw(ip, objectID string, count int) (string, error) {
+	body := fmt.Sprintf(`<ObjectID>%s</ObjectID>
+      <BrowseFlag>BrowseDirectChildren</BrowseFlag>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>%d</RequestedCount>
+      <SortCriteria></SortCriteria>`, xmlEscape(objectID), count)
+
+	respBody, err := contentDirectoryCall(ip, "Browse", body)
+	if err != nil {
+		return "", err
+	}
+
+	var parsed struct {
+		Body struct {
+			Resp struct {
+				Result string `xml:"Result"`
+			} `xml:"BrowseResponse"`
+		} `xml:"Body"`
+	}
+	if err := xml.Unmarshal(respBody, &parsed); err != nil {
+		return "", fmt.Errorf("parse Browse response: %w", err)
+	}
+	return parsed.Body.Resp.Result, nil
+}
+
+// spotifyAccount holds the Sonos-internal identifiers needed to build a
+// working Spotify share-link URI/metadata pair on a given household:
+// SID/ServiceType come from ListAvailableServices; AccountID/SN identify
+// which linked Spotify account to use and can't be queried directly (no
+// API exposes them), so they're read from an existing Spotify item
+// elsewhere on the system (see discoverSpotifyAccount).
+type spotifyAccount struct {
+	SID         int
+	ServiceType int
+	AccountID   string
+	SN          int
+}
+
+// spotifyAccountRe extracts an account ID and matching "sn" from a blob
+// of DIDL-Lite XML (as returned by browseRaw), given the household's
+// Spotify sid/serviceType (so other linked services' entries, and other
+// services' sid/sn pairs, aren't mistaken for Spotify's).
+func spotifyAccountRe(sid, serviceType int) (*regexp.Regexp, *regexp.Regexp) {
+	token := regexp.MustCompile(fmt.Sprintf(`SA_RINCON%d_X_#Svc%d-([0-9A-Za-z]+)-Token`, serviceType, serviceType))
+	sn := regexp.MustCompile(fmt.Sprintf(`[?&]sid=%d(?:&amp;|&)flags=\d+(?:&amp;|&)sn=(\d+)`, sid))
+	return token, sn
+}
+
+// findSpotifyAccountIn scans a ContentDirectory container (e.g. "FV:2"
+// for Sonos Favorites, "Q:0" for the play queue) for any Spotify item,
+// returning its account ID and sn if found.
+func findSpotifyAccountIn(ip, objectID string, sid, serviceType int) (accountID string, sn int, ok bool) {
+	raw, err := browseRaw(ip, objectID, 200)
+	if err != nil || raw == "" {
+		return "", 0, false
+	}
+	tokenRe, snRe := spotifyAccountRe(sid, serviceType)
+	tm := tokenRe.FindStringSubmatch(raw)
+	if tm == nil {
+		return "", 0, false
+	}
+	sm := snRe.FindStringSubmatch(raw)
+	if sm == nil {
+		return "", 0, false
+	}
+	snVal, err := strconv.Atoi(sm[1])
+	if err != nil {
+		return "", 0, false
+	}
+	return tm[1], snVal, true
+}
+
+// discoverSpotifyAccount figures out the spotifyAccount needed to build
+// working Spotify share-link requests on this household.
+//
+// SID/ServiceType are always looked up live via ListAvailableServices.
+// AccountID/SN come from, in order: the spotify_account/spotify_sn
+// config file settings (or SONOS_SPOTIFY_ACCOUNT/SONOS_SPOTIFY_SN env
+// vars); otherwise by scanning Sonos Favorites, then the play queue, for
+// an existing Spotify item to read them from.
+func discoverSpotifyAccount(ip string) (spotifyAccount, error) {
+	services, err := listMusicServices(ip)
+	if err != nil {
+		return spotifyAccount{}, fmt.Errorf("list music services: %w", err)
+	}
+	var acct spotifyAccount
+	found := false
+	for _, s := range services {
+		if s.Name == "Spotify" {
+			acct.SID, acct.ServiceType = s.ID, s.ServiceType
+			found = true
+			break
+		}
+	}
+	if !found {
+		return spotifyAccount{}, fmt.Errorf("Spotify doesn't appear to be available as a music service on this Sonos system")
+	}
+
+	accountOverride := firstNonEmpty(os.Getenv("SONOS_SPOTIFY_ACCOUNT"), cfg.SpotifyAccount)
+	snOverride := firstNonEmpty(os.Getenv("SONOS_SPOTIFY_SN"), cfg.SpotifySN)
+	if accountOverride != "" && snOverride != "" {
+		sn, err := strconv.Atoi(snOverride)
+		if err != nil {
+			return spotifyAccount{}, fmt.Errorf("invalid spotify_sn %q: must be a number", snOverride)
+		}
+		acct.AccountID, acct.SN = accountOverride, sn
+		return acct, nil
+	}
+
+	for _, objectID := range []string{"FV:2", "Q:0"} {
+		if accountID, sn, ok := findSpotifyAccountIn(ip, objectID, acct.SID, acct.ServiceType); ok {
+			acct.AccountID, acct.SN = accountID, sn
+			return acct, nil
+		}
+	}
+
+	return spotifyAccount{}, fmt.Errorf("couldn't determine your Spotify account on this Sonos system (no Spotify item found in Sonos Favorites or the play queue); either save any Spotify item to Sonos Favorites once, or set spotify_account/spotify_sn in the config file (or SONOS_SPOTIFY_ACCOUNT/SONOS_SPOTIFY_SN)")
+}
+
+// resolveSpotifyItem recognizes arg as a Spotify share link/URI and, if
+// so, builds the playItem needed to queue it. matched is true whenever
+// arg looked like a Spotify link at all, even if it couldn't ultimately
+// be resolved, so callers can distinguish "not Spotify" from "Spotify,
+// but unplayable" (e.g. acctErr is non-nil, or an unsupported type).
+func resolveSpotifyItem(arg string, acct spotifyAccount, acctErr error) (item playItem, matched bool, err error) {
+	shareType, id, ok := parseSpotifyShareLink(arg)
+	if !ok {
+		return playItem{}, false, nil
+	}
+	if acctErr != nil {
+		return playItem{}, true, acctErr
+	}
+
+	magic, ok := spotifyShareMagicByType[shareType]
+	if !ok {
+		return playItem{}, true, fmt.Errorf("spotify %q links aren't supported for playback (try a track, album, playlist, episode, show, or artist link)", shareType)
+	}
+
+	encoded := spotifyEncodeURI(shareType, id)
+	itemID := magic.key + encoded
+	descToken := fmt.Sprintf("SA_RINCON%d_X_#Svc%d-%s-Token", acct.ServiceType, acct.ServiceType, acct.AccountID)
+
+	var enqueueURI string
+	if magic.prefix == "" {
+		enqueueURI = fmt.Sprintf("x-sonos-spotify:%s?sid=%d&flags=%d&sn=%d", encoded, acct.SID, spotifyTrackURIFlags, acct.SN)
+	} else {
+		enqueueURI = fmt.Sprintf("%s%s?sid=%d&flags=%d&sn=%d", magic.prefix, encoded, acct.SID, spotifyContainerURIFlags, acct.SN)
+	}
+
+	return playItem{
+		URI:      enqueueURI,
+		Metadata: fmt.Sprintf(spotifyMetadataTemplate, itemID, magic.class, descToken),
+		Label:    fmt.Sprintf("spotify %s %s", shareType, id),
+	}, true, nil
+}
+
 func requireIP(fs *flag.FlagSet, ip string) {
 	if ip == "" {
 		fmt.Fprintln(os.Stderr, "error: speaker IP not set; pass --ip, set SONOS_SPEAKER_IP, or add it to the config file")
@@ -975,6 +1367,12 @@ func runPlay(args []string) {
 		fmt.Fprintf(os.Stderr, "via ffmpeg first if its extension isn't natively supported), and\n")
 		fmt.Fprintf(os.Stderr, "base-url + its file name is used; else it's a bare file name appended\n")
 		fmt.Fprintf(os.Stderr, "to base-url.\n")
+		fmt.Fprintf(os.Stderr, "\nA Spotify share link or URI (e.g. \"https://open.spotify.com/track/...\"\n")
+		fmt.Fprintf(os.Stderr, "or \"spotify:album:...\") is recognized and queued directly. A link to\n")
+		fmt.Fprintf(os.Stderr, "a track highlighted within an album (\"...?highlight=spotify:track:...\")\n")
+		fmt.Fprintf(os.Stderr, "plays that track, not the whole album. NOTE: current Sonos S2 firmware\n")
+		fmt.Fprintf(os.Stderr, "may reject this outright (UPnP error 800) regardless of setup; see\n")
+		fmt.Fprintf(os.Stderr, "https://github.com/SoCo/SoCo/issues/969.\n")
 		fmt.Fprintf(os.Stderr, "\nWith multiple arguments, all are queued in the order given. If the\n")
 		fmt.Fprintf(os.Stderr, "speaker is currently PLAYING, they're simply appended to the end of\n")
 		fmt.Fprintf(os.Stderr, "the queue without interrupting playback. Otherwise (or with --now),\n")
@@ -1024,24 +1422,55 @@ func runPlay(args []string) {
 	// touching the speaker's queue at all. Invalid/unplayable arguments
 	// (e.g. a .jpg) are skipped with a message rather than aborting the
 	// whole batch.
-	uris := make([]string, 0, fs.NArg())
+	//
+	// If any argument looks like a Spotify share link, do a one-time,
+	// read-only lookup of the account info needed to play it (see
+	// discoverSpotifyAccount); otherwise skip it, since it needs several
+	// round-trips to the speaker that plain file/URL args don't.
+	needSpotifyLookup := false
 	for _, arg := range fs.Args() {
+		if _, _, ok := parseSpotifyShareLink(arg); ok {
+			needSpotifyLookup = true
+			break
+		}
+	}
+	var spotifyAcct spotifyAccount
+	var spotifyAcctErr error
+	if needSpotifyLookup {
+		spotifyAcct, spotifyAcctErr = discoverSpotifyAccount(*ip)
+	}
+
+	items := make([]playItem, 0, fs.NArg())
+	for _, arg := range fs.Args() {
+		if item, matched, err := resolveSpotifyItem(arg, spotifyAcct, spotifyAcctErr); matched {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "skipping %q: %v\n", arg, err)
+				continue
+			}
+			items = append(items, item)
+			continue
+		}
+
 		uri, err := resolvePlayURL(*baseURL, *destDir, arg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "skipping %q: %v\n", arg, err)
 			continue
 		}
 		warnIfUnsupportedFormat(uri)
-		uris = append(uris, uri)
+		items = append(items, playItem{URI: uri})
 	}
 
-	if len(uris) == 0 {
+	if len(items) == 0 {
 		fmt.Fprintln(os.Stderr, "error: no valid files to play")
 		os.Exit(1)
 	}
 
-	if len(uris) == 1 {
-		uri := uris[0]
+	// A single plain file/URL (no metadata) keeps the original direct-play
+	// behavior. Anything with metadata (e.g. a Spotify share link) always
+	// goes through the queue below, even alone, since SetAVTransportURI
+	// can't play a music-service container/track directly without it.
+	if len(items) == 1 && items[0].Metadata == "" {
+		uri := items[0].URI
 		if !*now {
 			// If something is already playing, don't interrupt it: queue
 			// the track instead. If we can't determine the state for any
@@ -1064,8 +1493,9 @@ func runPlay(args []string) {
 		return
 	}
 
-	// Multiple files: always go through the queue, since there's no
-	// "play these N URLs in sequence" action other than the queue.
+	// Multiple files (or a single share link): always go through the
+	// queue, since there's no "play this in place, right now" action
+	// other than the queue for those.
 	playImmediately := *now
 	if !playImmediately {
 		state, err := getTransportState(*ip)
@@ -1075,10 +1505,10 @@ func runPlay(args []string) {
 	firstTrackNumber := 0
 	queueLength := 0
 	queuedCount := 0
-	for _, uri := range uris {
-		firstNum, newLength, err := addURIToQueue(*ip, uri, false)
+	for _, item := range items {
+		firstNum, newLength, err := addItemToQueue(*ip, item, false)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "skipping %q: %v\n", uri, err)
+			fmt.Fprintf(os.Stderr, "skipping %q: %v\n", item.label(), err)
 			continue
 		}
 		if queuedCount == 0 {
