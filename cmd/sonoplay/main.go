@@ -1800,17 +1800,25 @@ func runPlay(args []string) {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
-		t := tracks[index-1]
-		recordExplicitPlay(*dbFlag, t.URI, t.Title, t.Artist, t.Album)
+		// Prefer the richer metadata available right after playback
+		// actually starts (the same source runPlay's other two
+		// recording points use, and what's about to be printed below)
+		// over tracks[index-1]'s browseQueue snapshot, which can be as
+		// bare as a raw file name for a track the media server hasn't
+		// resolved full tags for yet - fall back to that snapshot only
+		// if this fails.
+		track := tracks[index-1]
 		if pos, err := getPositionInfo(*ip); err == nil {
-			track, _ := parseDIDLItem(pos.TrackMetaData)
-			if track.Title == "" && track.URI == "" {
-				track.URI = pos.TrackURI
+			if t, err := parseDIDLItem(pos.TrackMetaData); err == nil && (t.Title != "" || t.Artist != "" || t.Album != "") {
+				track.Title, track.Artist, track.Album = t.Title, t.Artist, t.Album
 			}
+			recordExplicitPlay(*dbFlag, track.URI, track.Title, track.Artist, track.Album)
 			if formatted := formatTrack(track); formatted != "" {
 				fmt.Printf("playing queue item %d: %s\n", index, formatted)
 				return
 			}
+		} else {
+			recordExplicitPlay(*dbFlag, track.URI, track.Title, track.Artist, track.Album)
 		}
 		fmt.Printf("playing queue item %d\n", index)
 		return
