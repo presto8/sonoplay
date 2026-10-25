@@ -10,6 +10,8 @@
 //	sonoplay toggle      [--ip <ip>]
 //	sonoplay list        [--ip <ip>]
 //	sonoplay remove      [--ip <ip>] <selector> [<selector> ...]
+//	sonoplay find        [--ip <ip>] <word> [<word> ...]
+//	sonoplay bump        [--ip <ip>] <selector> [<selector> ...]
 //
 // For backward compatibility, if the first argument isn't a known
 // subcommand, it's treated as `play <args...>`, e.g.:
@@ -421,6 +423,22 @@ func removeTrackRangeFromQueue(ip string, startingIndex, numberOfTracks int) err
 	return avTransportCall(ip, "RemoveTrackRangeFromQueue", body)
 }
 
+// reorderTrackRangeInQueue moves a contiguous range of numberOfTracks
+// tracks, starting at the given 1-based startingIndex, to immediately
+// before whatever is at 1-based position insertBefore - evaluated
+// against the queue's current (pre-this-call) state. Used by "bump" to
+// move tracks to play next. Unlike RemoveTrackRangeFromQueue,
+// ReorderTracksInQueue needs an explicit UpdateID (0 here, meaning "any
+// revision"), per every reference implementation checked.
+func reorderTrackRangeInQueue(ip string, startingIndex, numberOfTracks, insertBefore int) error {
+	body := fmt.Sprintf(`<InstanceID>0</InstanceID>
+      <StartingIndex>%d</StartingIndex>
+      <NumberOfTracks>%d</NumberOfTracks>
+      <InsertBefore>%d</InsertBefore>
+      <UpdateID>0</UpdateID>`, startingIndex, numberOfTracks, insertBefore)
+	return avTransportCall(ip, "ReorderTracksInQueue", body)
+}
+
 // getUDN fetches the speaker's device description and returns its UDN
 // (without the "uuid:" prefix), needed to address its play queue.
 func getUDN(ip string) (string, error) {
@@ -555,10 +573,44 @@ func parseTrackRange(selector string, maxIndex int) (start, end int, err error) 
 
 // queueTrack is one entry returned by browseQueue.
 type queueTrack struct {
+	// ID is the DIDL-Lite item's "id" attribute (e.g. "Q:0/5"), a stable
+	// per-slot identifier within the queue. It's used (in preference to
+	// URI) to re-locate a specific queue entry after the queue has been
+	// reordered, since URI alone can't disambiguate the same track
+	// appearing more than once in the queue. Empty for metadata parsed
+	// from a context with no DIDL item wrapper (e.g. parseDIDLItem on
+	// TrackMetaData, which never carries queue-slot identity anyway).
+	ID     string `xml:"id,attr"`
 	Title  string `xml:"title"`
 	Artist string `xml:"artist"`
 	Album  string `xml:"album"`
 	URI    string `xml:"res"`
+}
+
+// trackKey returns the best available stable identifier for a specific
+// queue slot: its DIDL item ID if known, falling back to its URI. Used to
+// re-locate the same queue entry across successive queue re-reads (e.g.
+// between the single-track moves bump makes), where positions shift but
+// identity doesn't. Note that URI-only fallback can't distinguish two
+// occurrences of the same track in the queue - ID is unambiguous (it's
+// the specific slot), so is always preferred when available.
+func trackKey(t queueTrack) string {
+	if t.ID != "" {
+		return t.ID
+	}
+	return t.URI
+}
+
+// findTrackPosition returns the 1-based position of the first track in
+// tracks whose trackKey matches key, or (-1, false) if none does (e.g.
+// the track was removed from the queue by something else between reads).
+func findTrackPosition(tracks []queueTrack, key string) (int, bool) {
+	for i, t := range tracks {
+		if trackKey(t) == key {
+			return i + 1, true
+		}
+	}
+	return -1, false
 }
 
 // queueBrowsePageSize is how many queue entries are requested per
@@ -809,6 +861,49 @@ func resolveSelectors(args []string, tracks []queueTrack) (positions []int, patt
 	}
 	sort.Ints(positions)
 	return positions, patternHits, nil
+}
+
+// ambiguousPatternHits returns the subset of patternHits (as returned by
+// resolveSelectors) whose "@pattern" selector matched more than one
+// track, preserving order. This is the pure decision logic behind
+// confirmMultiMatchOrExit, pulled out so it's testable without a live
+// speaker or the os.Exit side effect.
+func ambiguousPatternHits(patternHits []resolvePatternHit) []resolvePatternHit {
+	var ambiguous []resolvePatternHit
+	for _, hit := range patternHits {
+		if len(hit.positions) > 1 {
+			ambiguous = append(ambiguous, hit)
+		}
+	}
+	return ambiguous
+}
+
+// confirmMultiMatchOrExit checks patternHits (as returned by
+// resolveSelectors) for any "@pattern" selector that matched more than
+// one track. Plain number/range selectors never need confirmation, no
+// matter how many are given - only a search pattern can silently expand
+// to more tracks than the user may have expected. If yes is false and
+// any pattern matched multiple tracks, every such pattern's matches are
+// listed (via formatQueueRow, so the currently-playing row - if among
+// them - gets its usual marker) and the process exits 2 without the
+// caller's action (e.g. remove, bump) having touched the queue. verb
+// (e.g. "remove", "bump") is used in the printed instructions.
+func confirmMultiMatchOrExit(patternHits []resolvePatternHit, yes bool, tracks []queueTrack, matched int, pos positionInfo, verb string) {
+	if yes {
+		return
+	}
+	ambiguous := ambiguousPatternHits(patternHits)
+	if len(ambiguous) == 0 {
+		return
+	}
+	for _, hit := range ambiguous {
+		fmt.Fprintf(os.Stderr, "error: \"@%s\" matched more than one track:\n", hit.pattern)
+		for _, p := range hit.positions {
+			fmt.Fprintln(os.Stderr, formatQueueRow(p, tracks[p-1], p-1 == matched, pos))
+		}
+	}
+	fmt.Fprintf(os.Stderr, "pass -y/--yes to %s all of the above\n", verb)
+	os.Exit(2)
 }
 
 // setRelativeVolume adjusts the volume by adjustment (can be negative) and
@@ -1526,6 +1621,11 @@ func runPlay(args []string) {
 		fmt.Fprintf(os.Stderr, "treated as a 1-based position in the current queue (see '%s list'):\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "the speaker switches to its queue, jumps to that item, and plays it\n")
 		fmt.Fprintf(os.Stderr, "immediately. (Only applies with exactly one numeric argument.)\n")
+		fmt.Fprintf(os.Stderr, "\nA single argument starting with \"@\" (e.g. \"@amazing grace\") is treated\n")
+		fmt.Fprintf(os.Stderr, "the same way, but resolved by searching the queue (see '%s find') rather\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "than by position. If it matches more than one track, that's an error\n")
+		fmt.Fprintf(os.Stderr, "unless --first is given, in which case the first (lowest-positioned)\n")
+		fmt.Fprintf(os.Stderr, "match is played.\n")
 		fmt.Fprintf(os.Stderr, "\nOtherwise, each argument is resolved independently: if it contains\n")
 		fmt.Fprintf(os.Stderr, "\"://\" it's played as-is; else if --dest-dir is set it's treated as a\n")
 		fmt.Fprintf(os.Stderr, "local file path that gets copied into --dest-dir (transcoded to mp3\n")
@@ -1553,6 +1653,7 @@ func runPlay(args []string) {
 	baseURL := fs.String("base-url", firstNonEmpty(os.Getenv("SONOS_BASE_URL"), cfg.BaseURL), `base URL to prefix the file name with, e.g. "http://myhost/"`)
 	destDir := fs.String("dest-dir", firstNonEmpty(os.Getenv("SONOS_DEST_DIR"), cfg.DestDir), "local directory to copy the source file into before playing it")
 	now := fs.Bool("now", false, "play immediately, interrupting current playback, instead of enqueuing")
+	first := fs.Bool("first", false, "with an @pattern argument matching multiple tracks, play the first match instead of erroring")
 	fs.Parse(args)
 
 	requireIP(fs, *ip)
@@ -1562,9 +1663,36 @@ func runPlay(args []string) {
 		os.Exit(2)
 	}
 
-	// Single plain-number argument: jump straight to that queue position.
-	if fs.NArg() == 1 && isPositiveInteger(fs.Arg(0)) {
-		index, _ := strconv.Atoi(fs.Arg(0)) // safe: isPositiveInteger validated digits-only
+	// Single argument that's either a plain queue position (e.g. "3") or
+	// an "@pattern" search selector (e.g. "@amazing grace"): resolve it
+	// against the current queue and jump straight to the result, rather
+	// than treating it as a file/URL argument. Both forms go through
+	// resolveSelectors so there's one code path instead of two divergent
+	// ones; a bare number only ever resolves to itself (already
+	// range-checked by resolveSelectors), while "@pattern" may resolve
+	// to more than one position.
+	if fs.NArg() == 1 && (isPositiveInteger(fs.Arg(0)) || strings.HasPrefix(fs.Arg(0), selectorPatternPrefix)) {
+		tracks, _, err := browseQueue(*ip, 0)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		positions, _, err := resolveSelectors([]string{fs.Arg(0)}, tracks)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
+		index := positions[0] // lowest-positioned match; the only one unless an @pattern matched several
+		if len(positions) > 1 && !*first {
+			fmt.Fprintf(os.Stderr, "error: %q matches more than one track:\n", fs.Arg(0))
+			matched, pos, _ := currentQueuePosition(*ip, tracks)
+			for _, p := range positions {
+				fmt.Fprintln(os.Stderr, formatQueueRow(p, tracks[p-1], p-1 == matched, pos))
+			}
+			os.Exit(2)
+		}
+
 		if err := playQueueIndex(*ip, index); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
@@ -1861,6 +1989,45 @@ func visibleWindow(total, anchor, maxLines int) (start, end int, topEllipsis, bo
 	return start, end, true, true
 }
 
+// currentQueuePosition looks up the speaker's transport state and, if
+// something is actively loaded (PLAYING/PAUSED_PLAYBACK/TRANSITIONING),
+// matches its TrackURI against tracks to find which 0-based index (if
+// any) it corresponds to in the queue - the same "what's playing, and
+// where is it in the queue" check runList uses to place its "▶" marker,
+// shared here for play's multi-match listing and bump. matched is -1 if
+// nothing is playing, or what's playing isn't part of the queue (e.g. a
+// one-off direct-played URL).
+func currentQueuePosition(ip string, tracks []queueTrack) (matched int, pos positionInfo, havePos bool) {
+	matched = -1
+	state, err := getTransportState(ip)
+	if err != nil {
+		return matched, pos, false
+	}
+	switch state {
+	case "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING":
+	default:
+		return matched, pos, false
+	}
+	p, err := getPositionInfo(ip)
+	if err != nil {
+		return matched, pos, false
+	}
+	pos = p
+	havePos = true
+	if state == "PAUSED_PLAYBACK" {
+		pos.paused = true
+	}
+	if pos.TrackURI != "" {
+		for i, t := range tracks {
+			if t.URI == pos.TrackURI {
+				matched = i
+				break
+			}
+		}
+	}
+	return matched, pos, true
+}
+
 // formatQueueRow renders a single queue listing row, 1-based position i,
 // in the shared format used by both "list" and "find": "  12. Artist -
 // Title (Album)", or "▶  12. ..." plus the elapsed/duration suffix (see
@@ -1980,23 +2147,32 @@ func runList(args []string) {
 func runRemove(args []string) {
 	fs := flag.NewFlagSet("remove", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s remove [--ip <speaker-ip>] <selector> [<selector> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s remove [--ip <speaker-ip>] [-y|--yes] <selector> [<selector> ...]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nRemoves one or more tracks from the current play queue. Positions are\n")
 		fmt.Fprintf(os.Stderr, "1-based, matching '%s list' output.\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nEach <selector> is one of:\n")
-		fmt.Fprintf(os.Stderr, "  N      a single queue position, e.g. \"5\"\n")
-		fmt.Fprintf(os.Stderr, "  A-B    an inclusive range, e.g. \"1-9\"\n")
-		fmt.Fprintf(os.Stderr, "  A..B   same as A-B, e.g. \"1..9\"\n")
-		fmt.Fprintf(os.Stderr, "  A-     from A to the end of the queue, e.g. \"9-\"\n")
+		fmt.Fprintf(os.Stderr, "  N         a single queue position, e.g. \"5\"\n")
+		fmt.Fprintf(os.Stderr, "  A-B       an inclusive range, e.g. \"1-9\"\n")
+		fmt.Fprintf(os.Stderr, "  A..B      same as A-B, e.g. \"1..9\"\n")
+		fmt.Fprintf(os.Stderr, "  A-        from A to the end of the queue, e.g. \"9-\"\n")
+		fmt.Fprintf(os.Stderr, "  @word...  every track matching a '%s find'-style search, e.g. \"@amazing grace\"\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nAn @pattern selector matching more than one track requires -y/--yes\n")
+		fmt.Fprintf(os.Stderr, "to confirm removing all of them; the matches are listed so you can\n")
+		fmt.Fprintf(os.Stderr, "check before re-running with -y. Plain number/range selectors never\n")
+		fmt.Fprintf(os.Stderr, "require -y, however many are given.\n")
 		fmt.Fprintf(os.Stderr, "\nMultiple selectors may be given at once, e.g.:\n")
 		fmt.Fprintf(os.Stderr, "  %s remove 1 5 9\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s remove 1-9\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s remove -y @amazing\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
 		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n\n")
 		fs.PrintDefaults()
 	}
 
 	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	var yes bool
+	fs.BoolVar(&yes, "yes", false, "don't require confirmation when an @pattern selector matches multiple tracks")
+	fs.BoolVar(&yes, "y", false, "shorthand for --yes")
 	fs.Parse(args)
 
 	requireIP(fs, *ip)
@@ -2016,29 +2192,17 @@ func runRemove(args []string) {
 		os.Exit(1)
 	}
 
-	selected := map[int]bool{}
-	for _, arg := range fs.Args() {
-		start, end, err := parseTrackRange(arg, total)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: invalid selector %q: %v\n", arg, err)
-			os.Exit(2)
-		}
-		if start < 1 || end > total || start > end {
-			fmt.Fprintf(os.Stderr, "error: selector %q is out of range (queue has %d track(s))\n", arg, total)
-			os.Exit(2)
-		}
-		for i := start; i <= end; i++ {
-			selected[i] = true
-		}
+	indices, patternHits, err := resolveSelectors(fs.Args(), tracks)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
 	}
 
-	indices := make([]int, 0, len(selected))
-	for i := range selected {
-		indices = append(indices, i)
-	}
-	sort.Ints(indices)
+	matched, pos, _ := currentQueuePosition(*ip, tracks)
+	confirmMultiMatchOrExit(patternHits, yes, tracks, matched, pos, "remove")
 
 	// Show what's about to be removed before touching the queue.
+	// indices is already sorted ascending by resolveSelectors.
 	for _, i := range indices {
 		fmt.Printf("removing %3d. %s\n", i, formatTrack(tracks[i-1]))
 	}
@@ -2072,6 +2236,178 @@ func runRemove(args []string) {
 	fmt.Printf("removed %d track(s)\n", removed)
 }
 
+// bumpTargets resolves which tracks runBump needs to move: every
+// position in selected except currentPosition itself (which is already
+// "now", not "next", so it's silently dropped rather than moved),
+// returned as a list of trackKey identifiers in the same relative order
+// as selected (which resolveSelectors returns sorted ascending - i.e.
+// queue order), for use with findTrackPosition against subsequent,
+// freshly re-read queue snapshots. tracks must correspond 1:1 with
+// selected/currentPosition's positions (i.e. the same snapshot they were
+// computed against).
+func bumpTargets(selected []int, currentPosition int, tracks []queueTrack) (targets []string, droppedCurrent int) {
+	for _, p := range selected {
+		if p == currentPosition {
+			droppedCurrent++
+			continue
+		}
+		targets = append(targets, trackKey(tracks[p-1]))
+	}
+	return targets, droppedCurrent
+}
+
+func runBump(args []string) {
+	fs := flag.NewFlagSet("bump", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s bump [--ip <speaker-ip>] [-y|--yes] <selector> [<selector> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nMoves the matched/selected tracks to play immediately after whatever\n")
+		fmt.Fprintf(os.Stderr, "is currently playing, without otherwise changing the queue's order.\n")
+		fmt.Fprintf(os.Stderr, "Positions are 1-based, matching '%s list' output.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nEach <selector> is one of:\n")
+		fmt.Fprintf(os.Stderr, "  N         a single queue position, e.g. \"5\"\n")
+		fmt.Fprintf(os.Stderr, "  A-B       an inclusive range, e.g. \"1-9\"\n")
+		fmt.Fprintf(os.Stderr, "  A..B      same as A-B, e.g. \"1..9\"\n")
+		fmt.Fprintf(os.Stderr, "  A-        from A to the end of the queue, e.g. \"9-\"\n")
+		fmt.Fprintf(os.Stderr, "  @word...  every track matching a '%s find'-style search, e.g. \"@amazing grace\"\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nAn @pattern selector matching more than one track requires -y/--yes\n")
+		fmt.Fprintf(os.Stderr, "to confirm bumping all of them; the matches are listed so you can\n")
+		fmt.Fprintf(os.Stderr, "check before re-running with -y. Plain number/range selectors never\n")
+		fmt.Fprintf(os.Stderr, "require -y, however many are given.\n")
+		fmt.Fprintf(os.Stderr, "\nSomething must currently be playing from the queue - there's otherwise\n")
+		fmt.Fprintf(os.Stderr, "no well-defined \"next\" position to move tracks to. If a selected\n")
+		fmt.Fprintf(os.Stderr, "track is the one currently playing, it's silently left alone (it's\n")
+		fmt.Fprintf(os.Stderr, "already \"now\", not \"next\").\n")
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s bump @amazing\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s bump 42 50-52\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
+		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n\n")
+		fs.PrintDefaults()
+	}
+
+	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	var yes bool
+	fs.BoolVar(&yes, "yes", false, "don't require confirmation when an @pattern selector matches multiple tracks")
+	fs.BoolVar(&yes, "y", false, "shorthand for --yes")
+	fs.Parse(args)
+
+	requireIP(fs, *ip)
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	tracks, total, err := browseQueue(*ip, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	if total == 0 {
+		fmt.Fprintln(os.Stderr, "error: queue is empty")
+		os.Exit(1)
+	}
+
+	positions, patternHits, err := resolveSelectors(fs.Args(), tracks)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+
+	// Look up what's currently playing (if anything) before the -y
+	// guard below, purely so an ambiguous pattern's matches can be
+	// displayed with the usual "▶" marker if the now-playing track
+	// happens to be among them; the guard itself only depends on
+	// patternHits. Whether something usable is actually playing is
+	// checked separately, right after, since an @pattern match needing
+	// -y/--yes is a more specific problem than "nothing is playing" and
+	// should be reported first if both apply.
+	matched, pos, havePos := currentQueuePosition(*ip, tracks)
+
+	confirmMultiMatchOrExit(patternHits, yes, tracks, matched, pos, "bump")
+
+	if !havePos || matched == -1 {
+		fmt.Fprintln(os.Stderr, "error: nothing is currently playing from the queue to bump tracks after")
+		os.Exit(1)
+	}
+	currentPosition := matched + 1 // currentQueuePosition's matched is 0-based; selectors/positions are 1-based
+	anchorKey := trackKey(tracks[matched])
+
+	targets, droppedCurrent := bumpTargets(positions, currentPosition, tracks)
+	if droppedCurrent > 0 {
+		fmt.Printf("skipping %d selected track(s) already at the current position\n", droppedCurrent)
+	}
+	if len(targets) == 0 {
+		fmt.Println("nothing to do")
+		os.Exit(0)
+	}
+
+	// Move one target at a time, immediately after whatever was placed
+	// right before it (the current track, for the first target; the
+	// previous target, thereafter). Each iteration re-reads the live
+	// queue and re-locates both the anchor and the target by trackKey
+	// rather than trusting position arithmetic across multiple calls:
+	// a single ReorderTracksInQueue call's effect on *other* tracks'
+	// positions depends on whether the moved track started before or
+	// after the insertion point (see reorderTrackRangeInQueue), and that
+	// relationship can flip between one target and the next (e.g. a
+	// target upstream of the current track shifts the current track's
+	// own position) - so static bookkeeping across calls is fragile.
+	// Re-reading is simply correct by construction, at the cost of one
+	// extra Browse call per moved track, which is cheap relative to the
+	// interactive, low-volume nature of this command.
+	moved := 0
+	for _, targetKey := range targets {
+		liveTracks, _, err := browseQueue(*ip, 0)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: moved %d track(s) before failing: %v\n", moved, err)
+			os.Exit(1)
+		}
+		anchorPos, ok := findTrackPosition(liveTracks, anchorKey)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "error: moved %d track(s) before failing: lost track of the current queue position\n", moved)
+			os.Exit(1)
+		}
+		targetPos, ok := findTrackPosition(liveTracks, targetKey)
+		if !ok {
+			// No longer in the queue (e.g. removed concurrently by
+			// something else) - nothing to move, skip it rather than
+			// aborting the rest of the batch.
+			continue
+		}
+		if targetPos != anchorPos+1 {
+			if err := reorderTrackRangeInQueue(*ip, targetPos, 1, anchorPos+1); err != nil {
+				fmt.Fprintf(os.Stderr, "error: moved %d track(s) before failing: %v\n", moved, err)
+				os.Exit(1)
+			}
+		}
+		anchorKey = targetKey
+		moved++
+	}
+	fmt.Printf("moved %d track(s) to play next\n", moved)
+
+	// Show the result: re-browse (positions have shifted) and print the
+	// now-playing row plus the newly bumped tracks right after it, so
+	// the user can see where things landed without running a separate
+	// 'list'.
+	newTracks, newTotal, err := browseQueue(*ip, 0)
+	if err != nil {
+		return // best-effort; the move itself already succeeded
+	}
+	newMatched, newPos, _ := currentQueuePosition(*ip, newTracks)
+	start := newMatched
+	if start < 0 {
+		start = 0
+	}
+	end := start + 1 + moved
+	if end > newTotal {
+		end = newTotal
+	}
+	for i := start; i < end; i++ {
+		fmt.Println(formatQueueRow(i+1, newTracks[i], i == newMatched, newPos))
+	}
+}
+
 // nowPlayingLine renders the "▶ Title [elapsed/duration]" line used when
 // the currently playing track has no corresponding queue row to mark.
 func nowPlayingLine(t queueTrack, pos positionInfo) string {
@@ -2089,6 +2425,92 @@ func nowPlayingSuffix(pos positionInfo) string {
 		suffix += "  (paused)"
 	}
 	return suffix
+}
+
+// runFind implements "find"/"f": search the queue by title/artist/album/
+// file name and print the matching rows, in queue order.
+func runFind(args []string) {
+	fs := flag.NewFlagSet("find", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s find [--ip <speaker-ip>] [-n|--numbers-only] <word> [<word> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSearches the current play queue for tracks whose title, artist,\n")
+		fmt.Fprintf(os.Stderr, "album, or file name contains every given word, case-insensitively\n")
+		fmt.Fprintf(os.Stderr, "(an AND match; word order and which field each word matches don't\n")
+		fmt.Fprintf(os.Stderr, "matter). Matching rows are printed in queue order, e.g.:\n")
+		fmt.Fprintf(os.Stderr, "  %s find amazing grace\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nWith -n/--numbers-only, only the matching 1-based queue positions\n")
+		fmt.Fprintf(os.Stderr, "are printed, one per line, with no other output - handy for scripting,\n")
+		fmt.Fprintf(os.Stderr, "e.g.:\n")
+		fmt.Fprintf(os.Stderr, "  %s rm $(%s find -n foo)\n", os.Args[0], os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nExits 1 if nothing matches (like grep), so the result is scriptable.\n")
+		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
+		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n\n")
+		fs.PrintDefaults()
+	}
+
+	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	var numbersOnly bool
+	fs.BoolVar(&numbersOnly, "numbers-only", false, "print only the matching 1-based positions, one per line")
+	fs.BoolVar(&numbersOnly, "n", false, "shorthand for --numbers-only")
+	fs.Parse(args)
+
+	requireIP(fs, *ip)
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
+	words := fs.Args()
+
+	// See what's currently loaded, if anything, so a match that happens
+	// to also be the now-playing track gets the "▶" marker and elapsed
+	// time suffix (same pattern as runList).
+	var pos positionInfo
+	var havePos bool
+	if state, err := getTransportState(*ip); err == nil {
+		switch state {
+		case "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING":
+			if p, err := getPositionInfo(*ip); err == nil {
+				pos = p
+				havePos = true
+				if state == "PAUSED_PLAYBACK" {
+					pos.paused = true
+				}
+			}
+		}
+	}
+
+	tracks, _, err := browseQueue(*ip, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+
+	matched := -1
+	if havePos && pos.TrackURI != "" {
+		for i, t := range tracks {
+			if t.URI == pos.TrackURI {
+				matched = i
+				break
+			}
+		}
+	}
+
+	positions := matchQueue(tracks, words)
+	if len(positions) == 0 {
+		if !numbersOnly {
+			fmt.Println("no tracks match:", strings.Join(words, " "))
+		}
+		os.Exit(1)
+	}
+
+	for _, p := range positions {
+		if numbersOnly {
+			fmt.Println(p)
+			continue
+		}
+		fmt.Println(formatQueueRow(p, tracks[p-1], p-1 == matched, pos))
+	}
 }
 
 func runStatus(args []string) {
@@ -2217,6 +2639,8 @@ func printTopUsage() {
 		{"mute-off", "unmute the speaker"},
 		{"list, ls", "list the current play queue (-a/--all for the full list)"},
 		{"remove, rm", "remove tracks from the play queue (e.g. \"rm 1 5 9\", \"rm 1-9\")"},
+		{"find, f", "search the queue by title/artist/album/file name"},
+		{"bump, up-next", "move matched/selected tracks to play right after the current track"},
 		{"status", "show transport state, volume, and now playing"},
 		{"next, n", "skip to the next track"},
 		{"prev, previous, p", "skip to the previous track"},
@@ -2259,6 +2683,10 @@ func main() {
 		runList(os.Args[2:])
 	case "remove", "rm":
 		runRemove(os.Args[2:])
+	case "find", "f":
+		runFind(os.Args[2:])
+	case "bump", "up-next":
+		runBump(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	case "next", "n":
