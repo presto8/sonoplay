@@ -45,11 +45,16 @@ step = 2
   before handing them to the speaker, if set
 - `step` - default volume step size used by `volume-up`/`volume-down`
 
-`like`/`unlike`/`likes` store liked songs in a separate SQLite database
-(see [Liked songs](#liked-songs) below), whose path follows the same
-precedence: `--db`, then `SONOS_LIKES_DB`, then a `likes_db` config key,
-falling back to `$XDG_DATA_HOME/sonoplay/likes.db`
-(`~/.local/share/sonoplay/likes.db` if `$XDG_DATA_HOME` is unset).
+`like`/`unlike`/`likes` (and `history`) share a separate SQLite database
+(see [Liked songs](#liked-songs) and [Play history](#play-history)
+below), whose path follows the same precedence: `--db`, then `SONOS_DB`,
+then a `db` config key, falling back to
+`$XDG_DATA_HOME/sonoplay/sonoplay.db`
+(`~/.local/share/sonoplay/sonoplay.db` if `$XDG_DATA_HOME` is unset).
+`SONOS_LIKES_DB`/`likes_db` still work too, for compatibility with
+versions of sonoplay that only had likes - an existing `likes.db` at the
+default location is renamed to `sonoplay.db` automatically, once, the
+first time it's opened after upgrading.
 
 ## Commands
 
@@ -65,9 +70,10 @@ falling back to `$XDG_DATA_HOME/sonoplay/likes.db`
 | `find`, `f` | search the queue by title/artist/album/file name |
 | `remove`, `rm` | remove tracks from the play queue (e.g. `rm 1 5 9`, `rm 1-9`, `rm @amazing`) |
 | `bump`, `up-next` | move matched/selected tracks to play right after the current track |
-| `like` | like the current track, or matched/selected queue tracks |
+| `like` | like the current track, matched/selected queue tracks, or `--last` played |
 | `unlike` | remove the current or matched/selected tracks from likes |
 | `likes` | list liked songs (`--play` to queue/play them all) |
+| `history` | show play history (`--top` for most-played) |
 | `status`, `s` | show transport state, volume, and now playing |
 | `next`, `n` | skip to the next track |
 | `prev`, `previous`, `p` | skip to the previous track |
@@ -139,6 +145,42 @@ Liked tracks are replayed by their bare URL/file; this works for ordinary
 files and streams, but special per-service metadata (e.g. Spotify) isn't
 preserved, so such liked tracks may not replay correctly with
 `likes --play`.
+
+## Play history
+
+`play` records a song to a persistent play-history database whenever a
+single song actually starts playing right now - by file/URL, queue
+position/selector, or a single Spotify track link:
+
+```
+sonoplay song.mp3
+sonoplay play 5
+sonoplay play @amazing
+```
+
+Deliberately **not** recorded: several files/URLs in one command
+(including a shell wildcard like `*.mp3`, or a whole directory), a
+Spotify album/playlist/episode/show/artist link, `likes --play`,
+`next`/`prev`/`bump`, or anything merely added to the queue without
+playing immediately (e.g. `play song.mp3` while something else is
+already playing). The goal is a history of songs you deliberately picked
+one at a time, not a log of everything that ever passed through the
+queue.
+
+```
+sonoplay history             # the last 20 plays, newest first
+sonoplay history --since today
+sonoplay history --top       # most-played songs, by play count
+```
+
+A ♥ marks a song in the list that's also in your likes. `like --last`
+likes the most recent play in history that isn't the song currently
+playing - handy right after skipping a track you want to keep:
+
+```
+sonoplay next
+sonoplay like --last
+```
 
 ## Spotify share links
 
