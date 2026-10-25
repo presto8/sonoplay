@@ -56,7 +56,9 @@ step = 2
 | `mute-on` | mute the speaker |
 | `mute-off` | unmute the speaker |
 | `list`, `ls` | list the current play queue (`-a`/`--all` for the full list) |
-| `remove`, `rm` | remove tracks from the play queue (e.g. `rm 1 5 9`, `rm 1-9`) |
+| `find`, `f` | search the queue by title/artist/album/file name |
+| `remove`, `rm` | remove tracks from the play queue (e.g. `rm 1 5 9`, `rm 1-9`, `rm @amazing`) |
+| `bump`, `up-next` | move matched/selected tracks to play right after the current track |
 | `status` | show transport state, volume, and now playing |
 | `next`, `n` | skip to the next track |
 | `prev`, `previous`, `p` | skip to the previous track |
@@ -65,6 +67,29 @@ step = 2
 Run `sonoplay <command> -h` for full per-command help, including flags
 and selector syntax. A bare `sonoplay <file-or-url>` is shorthand for
 `sonoplay play <file-or-url>`.
+
+### Searching the queue
+
+`find` searches the queue by title, artist, album, or file name (every
+given word must match, case-insensitively, in any field):
+
+```
+sonoplay find amazing grace
+```
+
+`play` and `remove`/`rm` (and `bump`) also accept an `@pattern` selector
+in place of a numeric position, to act on searched tracks directly:
+
+```
+sonoplay play @amazing
+sonoplay rm @amazing
+sonoplay bump @amazing
+```
+
+If `@pattern` matches more than one track, `play` requires `--first` to
+pick the first match, and `remove`/`bump` require `-y`/`--yes` to confirm
+acting on all of them; otherwise the matches are listed and nothing is
+changed.
 
 ## Spotify share links
 
@@ -77,16 +102,6 @@ Note: as of this writing, current Sonos S2 firmware may reject
 third-party/non-Sonos-app playback of linked streaming-service content
 outright (UPnP error 800), regardless of setup; see
 [SoCo/SoCo#969](https://github.com/SoCo/SoCo/issues/969).
-
-## Coming soon
-
-Not yet implemented, but planned:
-
-- `find <words...>` - search the queue by title, artist, album, or file name
-- an `@pattern` selector, usable by `play` and `remove` in place of a
-  numeric position, to act on searched tracks (e.g. `sonoplay play
-  @amazing`)
-- `bump`/`up-next` - move matched/selected tracks to play next
 
 ## License
 
