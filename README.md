@@ -50,8 +50,8 @@ step = 2
 | Command | Description |
 | --- | --- |
 | `play <file-or-url>` | play a file/URL on the speaker (default if no command matches) |
-| `volume-up`, `up` | increase volume (`--step`, default 2) |
-| `volume-down`, `down` | decrease volume (`--step`, default 2) |
+| `volume-up`, `up`, `u` | increase volume (`--step`, default 2) |
+| `volume-down`, `down`, `d` | decrease volume (`--step`, default 2) |
 | `mute-toggle`, `mute` | toggle mute state |
 | `mute-on` | mute the speaker |
 | `mute-off` | unmute the speaker |
@@ -59,7 +59,7 @@ step = 2
 | `find`, `f` | search the queue by title/artist/album/file name |
 | `remove`, `rm` | remove tracks from the play queue (e.g. `rm 1 5 9`, `rm 1-9`, `rm @amazing`) |
 | `bump`, `up-next` | move matched/selected tracks to play right after the current track |
-| `status` | show transport state, volume, and now playing |
+| `status`, `s` | show transport state, volume, and now playing |
 | `next`, `n` | skip to the next track |
 | `prev`, `previous`, `p` | skip to the previous track |
 | `stop` | stop playback |
