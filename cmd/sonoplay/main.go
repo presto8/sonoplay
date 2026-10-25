@@ -561,21 +561,30 @@ type queueTrack struct {
 	URI    string `xml:"res"`
 }
 
-// browseQueue lists the speaker's current play queue (object "Q:0") via the
-// ContentDirectory service's Browse action. It returns the tracks along
-// with the total number of tracks in the queue (useful if len(tracks) was
-// capped by count).
-func browseQueue(ip string, count int) (tracks []queueTrack, totalMatches int, err error) {
+// queueBrowsePageSize is how many queue entries are requested per
+// ContentDirectory Browse call. Sonos (and UPnP media servers generally)
+// may silently cap a single Browse response well below any count asked
+// for - 100 items is a commonly seen limit - so browseQueue pages through
+// StartingIndex rather than trusting one request to return everything.
+const queueBrowsePageSize = 100
+
+// browseQueuePage runs a single ContentDirectory Browse call against the
+// play queue (object "Q:0"), starting at the given 0-based index and
+// asking for up to count items. It returns the tracks on that page, the
+// number of items the server actually returned, and the total number of
+// tracks in the queue (which may exceed both count and the number
+// returned, if the server capped the page smaller than requested).
+func browseQueuePage(ip string, startingIndex, count int) (tracks []queueTrack, numberReturned, totalMatches int, err error) {
 	body := fmt.Sprintf(`<ObjectID>Q:0</ObjectID>
       <BrowseFlag>BrowseDirectChildren</BrowseFlag>
       <Filter>*</Filter>
-      <StartingIndex>0</StartingIndex>
+      <StartingIndex>%d</StartingIndex>
       <RequestedCount>%d</RequestedCount>
-      <SortCriteria></SortCriteria>`, count)
+      <SortCriteria></SortCriteria>`, startingIndex, count)
 
 	respBody, err := contentDirectoryCall(ip, "Browse", body)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	// The outer SOAP envelope carries the inner DIDL-Lite XML as ordinary
@@ -593,7 +602,7 @@ func browseQueue(ip string, count int) (tracks []queueTrack, totalMatches int, e
 		} `xml:"Body"`
 	}
 	if err := xml.Unmarshal(respBody, &parsed); err != nil {
-		return nil, 0, fmt.Errorf("parse Browse response: %w", err)
+		return nil, 0, 0, fmt.Errorf("parse Browse response: %w", err)
 	}
 
 	var didl struct {
@@ -601,11 +610,49 @@ func browseQueue(ip string, count int) (tracks []queueTrack, totalMatches int, e
 	}
 	if parsed.Body.Resp.Result != "" {
 		if err := xml.Unmarshal([]byte(parsed.Body.Resp.Result), &didl); err != nil {
-			return nil, 0, fmt.Errorf("parse DIDL-Lite queue contents: %w", err)
+			return nil, 0, 0, fmt.Errorf("parse DIDL-Lite queue contents: %w", err)
 		}
 	}
 
-	return didl.Items, parsed.Body.Resp.TotalMatches, nil
+	return didl.Items, parsed.Body.Resp.NumberReturned, parsed.Body.Resp.TotalMatches, nil
+}
+
+// browseQueue lists the speaker's current play queue (object "Q:0") via
+// the ContentDirectory service's Browse action, paging through
+// browseQueuePage as needed so the result always covers the whole queue
+// regardless of any per-request cap the server imposes. If count is
+// positive, at most that many tracks are returned (still potentially
+// requiring multiple page requests to reach); if count is 0, every track
+// in the queue is returned. The returned totalMatches is the queue's full
+// length, even when fewer tracks than that are returned because of count.
+func browseQueue(ip string, count int) (tracks []queueTrack, totalMatches int, err error) {
+	want := count
+	for {
+		pageSize := queueBrowsePageSize
+		if want > 0 && want-len(tracks) < pageSize {
+			pageSize = want - len(tracks)
+		}
+		page, numberReturned, total, err := browseQueuePage(ip, len(tracks), pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		tracks = append(tracks, page...)
+		totalMatches = total
+
+		if numberReturned == 0 {
+			// Nothing more to fetch (either the queue is exhausted, or the
+			// server returned an empty page for some other reason) - stop
+			// here rather than looping forever.
+			break
+		}
+		if len(tracks) >= total {
+			break
+		}
+		if want > 0 && len(tracks) >= want {
+			break
+		}
+	}
+	return tracks, totalMatches, nil
 }
 
 // parseDIDLItem parses a single-item DIDL-Lite XML blob, as returned in
