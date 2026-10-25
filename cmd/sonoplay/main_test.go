@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 // intsEqual compares two int slices by content, treating nil and an
@@ -622,6 +623,82 @@ func TestBumpTargets(t *testing.T) {
 			}
 			if dropped != c.wantDropped {
 				t.Errorf("bumpTargets(%v, %d) dropped = %d, want %d", c.selected, c.currentPosition, dropped, c.wantDropped)
+			}
+		})
+	}
+}
+
+func TestLikedSongLine(t *testing.T) {
+	s := likedSong{
+		URI:       "http://host/a.mp3",
+		Title:     "Amazing Grace",
+		Artist:    "Traditional",
+		Album:     "Hymns",
+		LikeCount: 3,
+		LastLiked: time.Date(2024, 3, 2, 15, 4, 0, 0, time.UTC),
+	}
+	got := likedSongLine(s)
+	want := " 3x  " + s.LastLiked.Local().Format("2006-01-02 15:04") + "  Traditional - Amazing Grace (Hymns)"
+	if got != want {
+		t.Errorf("likedSongLine(%+v) = %q, want %q", s, got, want)
+	}
+}
+
+func TestLikeEntryLine(t *testing.T) {
+	e := likeEntry{
+		URI:     "http://host/a.mp3",
+		Title:   "Amazing Grace",
+		Artist:  "Traditional",
+		LikedAt: time.Date(2024, 3, 2, 15, 4, 5, 0, time.UTC),
+	}
+	got := likeEntryLine(e)
+	want := e.LikedAt.Local().Format("2006-01-02 15:04:05") + "  Traditional - Amazing Grace"
+	if got != want {
+		t.Errorf("likeEntryLine(%+v) = %q, want %q", e, got, want)
+	}
+}
+
+func TestBuildLikeTargets(t *testing.T) {
+	tracks := []queueTrack{
+		{Title: "Alpha", URI: "u1"},
+		{Title: "Beta", URI: "u2"},
+		{Title: "Gamma", URI: "u3"},
+	}
+
+	cases := []struct {
+		name      string
+		positions []int
+		want      []likeTarget
+	}{
+		{
+			name:      "nil positions yields empty, non-nil slice",
+			positions: nil,
+			want:      []likeTarget{},
+		},
+		{
+			name:      "single position",
+			positions: []int{2},
+			want:      []likeTarget{{position: 2, track: tracks[1]}},
+		},
+		{
+			name:      "multiple positions preserve order",
+			positions: []int{1, 3},
+			want: []likeTarget{
+				{position: 1, track: tracks[0]},
+				{position: 3, track: tracks[2]},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildLikeTargets(c.positions, tracks)
+			if len(got) != len(c.want) {
+				t.Fatalf("buildLikeTargets(%v) = %+v, want %+v", c.positions, got, c.want)
+			}
+			for i := range got {
+				if got[i].position != c.want[i].position || got[i].track.URI != c.want[i].track.URI {
+					t.Errorf("buildLikeTargets(%v)[%d] = %+v, want %+v", c.positions, i, got[i], c.want[i])
+				}
 			}
 		})
 	}
