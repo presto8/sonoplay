@@ -627,6 +627,52 @@ func TestBumpTargets(t *testing.T) {
 	}
 }
 
+func TestBuildLikeTargets(t *testing.T) {
+	tracks := []queueTrack{
+		{Title: "Alpha", URI: "u1"},
+		{Title: "Beta", URI: "u2"},
+		{Title: "Gamma", URI: "u3"},
+	}
+
+	cases := []struct {
+		name      string
+		positions []int
+		want      []likeTarget
+	}{
+		{
+			name:      "nil positions yields empty, non-nil slice",
+			positions: nil,
+			want:      []likeTarget{},
+		},
+		{
+			name:      "single position",
+			positions: []int{2},
+			want:      []likeTarget{{position: 2, track: tracks[1]}},
+		},
+		{
+			name:      "multiple positions preserve order",
+			positions: []int{1, 3},
+			want: []likeTarget{
+				{position: 1, track: tracks[0]},
+				{position: 3, track: tracks[2]},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildLikeTargets(c.positions, tracks)
+			if len(got) != len(c.want) {
+				t.Fatalf("buildLikeTargets(%v) = %+v, want %+v", c.positions, got, c.want)
+			}
+			for i := range got {
+				if got[i].position != c.want[i].position || got[i].track.URI != c.want[i].track.URI {
+					t.Errorf("buildLikeTargets(%v)[%d] = %+v, want %+v", c.positions, i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestTerminalSafetyMargin(t *testing.T) {
 	cases := []struct {
 		rows int

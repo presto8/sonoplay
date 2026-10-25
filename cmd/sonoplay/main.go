@@ -86,6 +86,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"database/sql"
 	"encoding/xml"
 	"flag"
 	"fmt"
@@ -2722,6 +2723,190 @@ func runStop(args []string) {
 	fmt.Println("stopped")
 }
 
+// likeTarget is one thing for runLike/runUnlike to act on: either the
+// currently playing track (the no-selector-args case; position == 0,
+// since there's no queue position involved - it may not even be part of
+// the saved queue) or a specific 1-based queue position and its track
+// (the selector-args case).
+type likeTarget struct {
+	position int
+	track    queueTrack
+}
+
+// buildLikeTargets converts resolved 1-based queue positions (as
+// returned by resolveSelectors, already sorted ascending) into
+// likeTargets by looking up each one's track in tracks. Pulled out of
+// resolveLikeTargets purely so this part is unit-testable without a
+// live speaker.
+func buildLikeTargets(positions []int, tracks []queueTrack) []likeTarget {
+	targets := make([]likeTarget, 0, len(positions))
+	for _, p := range positions {
+		targets = append(targets, likeTarget{position: p, track: tracks[p-1]})
+	}
+	return targets
+}
+
+// resolveLikeTargets implements the target-selection logic shared by
+// runLike and runUnlike:
+//
+//   - With no selector args, the single currently playing track,
+//     wherever it came from (not necessarily part of the saved queue -
+//     this also works right after a one-off "play <url>", since only
+//     title/artist/album/URI from positionInfo are needed, not a queue
+//     position). Returned as a single likeTarget with position == 0.
+//   - With selector args, the matching queue position(s) (via
+//     browseQueue + resolveSelectors), subject to the same -y/--yes
+//     multi-match-@pattern guard remove/bump use
+//     (confirmMultiMatchOrExit).
+//
+// Like every other run* function, this prints its own error message and
+// exits rather than returning an error: the right exit code differs by
+// failure (1 for "nothing is playing"/"queue is empty", 2 for bad
+// selector syntax or an unconfirmed multi-match - the last of which
+// confirmMultiMatchOrExit itself handles), so there's no single error
+// value that would let callers decide uniformly anyway. verb (e.g.
+// "like", "unlike") is used in the "nothing is currently playing"
+// message and passed through to confirmMultiMatchOrExit.
+func resolveLikeTargets(ip string, args []string, yes bool, verb string) []likeTarget {
+	if len(args) == 0 {
+		var pos positionInfo
+		var havePos bool
+		if state, err := getTransportState(ip); err == nil {
+			switch state {
+			case "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING":
+				if p, err := getPositionInfo(ip); err == nil {
+					pos = p
+					havePos = true
+					if state == "PAUSED_PLAYBACK" {
+						pos.paused = true
+					}
+				}
+			}
+		}
+		track, _ := parseDIDLItem(pos.TrackMetaData)
+		if track.Title == "" && track.URI == "" {
+			track.URI = pos.TrackURI
+		}
+		if !havePos || track.URI == "" {
+			fmt.Fprintf(os.Stderr, "error: nothing is currently playing to %s\n", verb)
+			os.Exit(1)
+		}
+		return []likeTarget{{track: track}}
+	}
+
+	tracks, total, err := browseQueue(ip, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	if total == 0 {
+		fmt.Fprintln(os.Stderr, "error: queue is empty")
+		os.Exit(1)
+	}
+
+	positions, patternHits, err := resolveSelectors(args, tracks)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+
+	matched, pos, _ := currentQueuePosition(ip, tracks)
+	confirmMultiMatchOrExit(patternHits, yes, tracks, matched, pos, verb)
+
+	return buildLikeTargets(positions, tracks)
+}
+
+// openLikesDBOrExit resolves dbFlagValue (the --db flag) to a path (see
+// likesDBPath) and opens it (see openLikesDB), printing a clear error
+// and exiting 1 on failure at either step. Shared by runLike, runUnlike,
+// and runLikes.
+func openLikesDBOrExit(dbFlagValue string) *sql.DB {
+	path, err := likesDBPath(dbFlagValue)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: open likes database:", err)
+		os.Exit(1)
+	}
+	db, err := openLikesDB(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: open likes database:", err)
+		os.Exit(1)
+	}
+	return db
+}
+
+func runLike(args []string) {
+	fs := flag.NewFlagSet("like", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s like [--ip <speaker-ip>] [--db <path>] [-y|--yes] [<selector> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nRecords a song in a persistent \"likes\" database (separate from, and\n")
+		fmt.Fprintf(os.Stderr, "surviving, the speaker's play queue), for later listing or replay\n")
+		fmt.Fprintf(os.Stderr, "with '%s likes'.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nWith no <selector> arguments, likes whatever is currently playing\n")
+		fmt.Fprintf(os.Stderr, "(whether or not it's part of the saved queue - this also works right\n")
+		fmt.Fprintf(os.Stderr, "after a one-off '%s play <url>').\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nWith <selector> arguments, likes the matched/selected tracks in the\n")
+		fmt.Fprintf(os.Stderr, "current play queue instead. Positions are 1-based, matching\n")
+		fmt.Fprintf(os.Stderr, "'%s list' output. Each <selector> is one of:\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  N         a single queue position, e.g. \"5\"\n")
+		fmt.Fprintf(os.Stderr, "  A-B       an inclusive range, e.g. \"1-9\"\n")
+		fmt.Fprintf(os.Stderr, "  A..B      same as A-B, e.g. \"1..9\"\n")
+		fmt.Fprintf(os.Stderr, "  A-        from A to the end of the queue, e.g. \"9-\"\n")
+		fmt.Fprintf(os.Stderr, "  @word...  every track matching a '%s find'-style search, e.g. \"@amazing grace\"\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSeveral @-selectors narrow the search rather than searching\n")
+		fmt.Fprintf(os.Stderr, "separately, the same AND semantics as remove/bump; an @pattern\n")
+		fmt.Fprintf(os.Stderr, "matching more than one track requires -y/--yes to confirm liking all\n")
+		fmt.Fprintf(os.Stderr, "of them.\n")
+		fmt.Fprintf(os.Stderr, "\nLiking an already-liked song just adds another like event rather\n")
+		fmt.Fprintf(os.Stderr, "than erroring or no-op'ing - it's a history, not a toggle, so\n")
+		fmt.Fprintf(os.Stderr, "'%s likes --history' shows every time you liked something, and\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "'%s likes' shows each song's total like count.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nNote: liked tracks are replayed by their bare URL/file; this works\n")
+		fmt.Fprintf(os.Stderr, "fine for ordinary files and streams, but special per-service metadata\n")
+		fmt.Fprintf(os.Stderr, "(e.g. Spotify) isn't preserved, so such liked tracks may not replay\n")
+		fmt.Fprintf(os.Stderr, "correctly with '%s likes --play'.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
+		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n")
+		fmt.Fprintf(os.Stderr, "  --db  SONOS_LIKES_DB    likes_db\n\n")
+		fs.PrintDefaults()
+	}
+
+	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	dbFlag := fs.String("db", "", "override the likes database path")
+	var yes bool
+	fs.BoolVar(&yes, "yes", false, "don't require confirmation when an @pattern selector matches multiple tracks")
+	fs.BoolVar(&yes, "y", false, "shorthand for --yes")
+	fs.Parse(args)
+
+	requireIP(fs, *ip)
+
+	db := openLikesDBOrExit(*dbFlag)
+	defer db.Close()
+
+	targets := resolveLikeTargets(*ip, fs.Args(), yes, "like")
+
+	if len(targets) == 1 && targets[0].position == 0 {
+		t := targets[0].track
+		if err := addLike(db, t.URI, t.Title, t.Artist, t.Album); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		fmt.Println("liked:", formatTrack(t))
+		return
+	}
+
+	liked := 0
+	for _, tgt := range targets {
+		t := tgt.track
+		if err := addLike(db, t.URI, t.Title, t.Artist, t.Album); err != nil {
+			fmt.Fprintf(os.Stderr, "error: liked %d track(s) before failing: %v\n", liked, err)
+			os.Exit(1)
+		}
+		fmt.Printf("liked %3d. %s\n", tgt.position, formatTrack(t))
+		liked++
+	}
+	fmt.Printf("liked %d track(s)\n", liked)
+}
+
 func printTopUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s <command> [flags] [args]\n\n", os.Args[0])
 	fmt.Fprintln(os.Stderr, "Commands:")
@@ -2736,6 +2921,7 @@ func printTopUsage() {
 		{"remove, rm", "remove tracks from the play queue (e.g. \"rm 1 5 9\", \"rm 1-9\")"},
 		{"find, f", "search the queue by title/artist/album/file name"},
 		{"bump, up-next", "move matched/selected tracks to play right after the current track"},
+		{"like", "like the current track, or matched/selected queue tracks"},
 		{"status, s", "show transport state, volume, and now playing"},
 		{"next, n", "skip to the next track"},
 		{"prev, previous, p", "skip to the previous track"},
@@ -2782,6 +2968,8 @@ func main() {
 		runFind(os.Args[2:])
 	case "bump", "up-next":
 		runBump(os.Args[2:])
+	case "like":
+		runLike(os.Args[2:])
 	case "status", "s":
 		runStatus(os.Args[2:])
 	case "next", "n":
