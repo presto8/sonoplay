@@ -15,18 +15,8 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
-
-// likesSchemaVersion is recorded via PRAGMA user_version so future
-// changes to the schema can detect and migrate older databases. There's
-// only ever been version 1 so far; bump this and add a migration step in
-// openLikesDB if the schema changes.
-const likesSchemaVersion = 1
 
 // likeEntry is a single row in the likes table: one like event.
 type likeEntry struct {
@@ -47,102 +37,6 @@ type likedSong struct {
 	Album     string
 	LikeCount int
 	LastLiked time.Time // UTC; the most recent like of this URI
-}
-
-// userDataDir returns $XDG_DATA_HOME, falling back to ~/.local/share if
-// unset, per the XDG base directory spec. Unlike os.UserConfigDir (used
-// by configFilePath), the standard library has no built-in equivalent
-// for the data directory, so this is done by hand; sonoplay's data
-// directory use is Linux-first, like the rest of its XDG handling.
-func userDataDir() (string, error) {
-	if dir := os.Getenv("XDG_DATA_HOME"); dir != "" {
-		return dir, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".local", "share"), nil
-}
-
-// likesDBPath resolves the path to the likes database, in order of
-// precedence: flagValue (the --db flag, empty if not given),
-// SONOS_LIKES_DB, the likes_db config key, and finally
-// $XDG_DATA_HOME/sonoplay/likes.db (see userDataDir).
-func likesDBPath(flagValue string) (string, error) {
-	if path := firstNonEmpty(flagValue, os.Getenv("SONOS_LIKES_DB"), cfg.LikesDB); path != "" {
-		return path, nil
-	}
-	dir, err := userDataDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "sonoplay", "likes.db"), nil
-}
-
-// openLikesDB opens (creating if necessary, including parent
-// directories) the SQLite database at path and ensures its schema is up
-// to date. Callers must Close() the returned *sql.DB.
-func openLikesDB(path string) (*sql.DB, error) {
-	if dir := filepath.Dir(path); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("create likes database directory %q: %w", dir, err)
-		}
-	}
-
-	// busy_timeout: if another sonoplay invocation (or anything else)
-	// holds the database locked for a write, wait up to 5s for it to
-	// finish rather than immediately failing with SQLITE_BUSY - likes
-	// are small/quick operations, so a short wait is enough and avoids
-	// spurious errors from e.g. two commands run back-to-back in a
-	// script.
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
-	if err != nil {
-		return nil, fmt.Errorf("open likes database %q: %w", path, err)
-	}
-
-	if err := migrateLikesDB(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("set up likes database %q: %w", path, err)
-	}
-
-	return db, nil
-}
-
-// migrateLikesDB creates the likes table if it doesn't exist yet. There's
-// only ever been one schema version so far, so this just creates it
-// outright and stamps user_version; a future schema change would check
-// the existing user_version here and migrate forward from it instead.
-func migrateLikesDB(db *sql.DB) error {
-	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return fmt.Errorf("read schema version: %w", err)
-	}
-	if version >= likesSchemaVersion {
-		return nil
-	}
-	if version != 0 {
-		return fmt.Errorf("likes database has schema version %d, newer than this version of sonoplay supports (%d) - upgrade sonoplay", version, likesSchemaVersion)
-	}
-
-	const schema = `
-CREATE TABLE IF NOT EXISTS likes (
-	id       INTEGER PRIMARY KEY,
-	liked_at TEXT NOT NULL,
-	uri      TEXT NOT NULL,
-	title    TEXT NOT NULL DEFAULT '',
-	artist   TEXT NOT NULL DEFAULT '',
-	album    TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS likes_uri ON likes(uri);
-`
-	if _, err := db.Exec(schema); err != nil {
-		return fmt.Errorf("create schema: %w", err)
-	}
-	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, likesSchemaVersion)); err != nil {
-		return fmt.Errorf("set schema version: %w", err)
-	}
-	return nil
 }
 
 // addLike records a new like of the track identified by uri (required;

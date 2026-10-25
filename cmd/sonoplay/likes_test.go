@@ -7,13 +7,13 @@ import (
 	"time"
 )
 
-func TestOpenLikesDBCreatesParentDirAndIsIdempotent(t *testing.T) {
+func TestOpenDBCreatesParentDirAndIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "nested", "likes.db")
+	path := filepath.Join(dir, "nested", "sonoplay.db")
 
-	db1, err := openLikesDB(path)
+	db1, err := openDB(path, false)
 	if err != nil {
-		t.Fatalf("first openLikesDB(%q): %v", path, err)
+		t.Fatalf("first openDB(%q): %v", path, err)
 	}
 	db1.Close()
 
@@ -23,9 +23,9 @@ func TestOpenLikesDBCreatesParentDirAndIsIdempotent(t *testing.T) {
 
 	// Opening again (as a second invocation of sonoplay would) must not
 	// error, and must not wipe existing data.
-	db2, err := openLikesDB(path)
+	db2, err := openDB(path, false)
 	if err != nil {
-		t.Fatalf("second openLikesDB(%q): %v", path, err)
+		t.Fatalf("second openDB(%q): %v", path, err)
 	}
 	defer db2.Close()
 
@@ -42,10 +42,10 @@ func TestOpenLikesDBCreatesParentDirAndIsIdempotent(t *testing.T) {
 }
 
 func TestAddLikeRejectsEmptyURI(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "likes.db")
-	db, err := openLikesDB(path)
+	path := filepath.Join(t.TempDir(), "sonoplay.db")
+	db, err := openDB(path, false)
 	if err != nil {
-		t.Fatalf("openLikesDB: %v", err)
+		t.Fatalf("openDB: %v", err)
 	}
 	defer db.Close()
 
@@ -55,10 +55,10 @@ func TestAddLikeRejectsEmptyURI(t *testing.T) {
 }
 
 func TestAddLikeRecordsEveryLikeAsANewRow(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "likes.db")
-	db, err := openLikesDB(path)
+	path := filepath.Join(t.TempDir(), "sonoplay.db")
+	db, err := openDB(path, false)
 	if err != nil {
-		t.Fatalf("openLikesDB: %v", err)
+		t.Fatalf("openDB: %v", err)
 	}
 	defer db.Close()
 
@@ -92,9 +92,9 @@ func TestAddLikeRecordsEveryLikeAsANewRow(t *testing.T) {
 
 func TestListLikedSongsOrderingAndMetadata(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "likes.db")
-	db, err := openLikesDB(path)
+	db, err := openDB(path, false)
 	if err != nil {
-		t.Fatalf("openLikesDB: %v", err)
+		t.Fatalf("openDB: %v", err)
 	}
 	defer db.Close()
 
@@ -139,9 +139,9 @@ func TestListLikedSongsOrderingAndMetadata(t *testing.T) {
 
 func TestListLikeHistoryNewestFirst(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "likes.db")
-	db, err := openLikesDB(path)
+	db, err := openDB(path, false)
 	if err != nil {
-		t.Fatalf("openLikesDB: %v", err)
+		t.Fatalf("openDB: %v", err)
 	}
 	defer db.Close()
 
@@ -172,9 +172,9 @@ func TestListLikeHistoryNewestFirst(t *testing.T) {
 
 func TestDeleteLikesRemovesAllRowsForURI(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "likes.db")
-	db, err := openLikesDB(path)
+	db, err := openDB(path, false)
 	if err != nil {
-		t.Fatalf("openLikesDB: %v", err)
+		t.Fatalf("openDB: %v", err)
 	}
 	defer db.Close()
 
@@ -206,9 +206,9 @@ func TestDeleteLikesRemovesAllRowsForURI(t *testing.T) {
 
 func TestDeleteLikesOfUnlikedURIRemovesNothing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "likes.db")
-	db, err := openLikesDB(path)
+	db, err := openDB(path, false)
 	if err != nil {
-		t.Fatalf("openLikesDB: %v", err)
+		t.Fatalf("openDB: %v", err)
 	}
 	defer db.Close()
 
@@ -218,83 +218,5 @@ func TestDeleteLikesOfUnlikedURIRemovesNothing(t *testing.T) {
 	}
 	if removed != 0 {
 		t.Errorf("deleteLikes of never-liked URI removed = %d, want 0", removed)
-	}
-}
-
-func TestLikesDBPathPrecedence(t *testing.T) {
-	t.Run("flag value wins over everything", func(t *testing.T) {
-		savedCfg := cfg
-		t.Cleanup(func() { cfg = savedCfg })
-		cfg.LikesDB = "/cfg/likes.db"
-		t.Setenv("SONOS_LIKES_DB", "/env/likes.db")
-
-		got, err := likesDBPath("/flag/likes.db")
-		if err != nil {
-			t.Fatalf("likesDBPath: %v", err)
-		}
-		if got != "/flag/likes.db" {
-			t.Errorf("likesDBPath = %q, want the flag value", got)
-		}
-	})
-
-	t.Run("env wins over config when flag is empty", func(t *testing.T) {
-		savedCfg := cfg
-		t.Cleanup(func() { cfg = savedCfg })
-		cfg.LikesDB = "/cfg/likes.db"
-		t.Setenv("SONOS_LIKES_DB", "/env/likes.db")
-
-		got, err := likesDBPath("")
-		if err != nil {
-			t.Fatalf("likesDBPath: %v", err)
-		}
-		if got != "/env/likes.db" {
-			t.Errorf("likesDBPath = %q, want the env value", got)
-		}
-	})
-
-	t.Run("config wins over default when flag and env are empty", func(t *testing.T) {
-		savedCfg := cfg
-		t.Cleanup(func() { cfg = savedCfg })
-		cfg.LikesDB = "/cfg/likes.db"
-		t.Setenv("SONOS_LIKES_DB", "")
-
-		got, err := likesDBPath("")
-		if err != nil {
-			t.Fatalf("likesDBPath: %v", err)
-		}
-		if got != "/cfg/likes.db" {
-			t.Errorf("likesDBPath = %q, want the config value", got)
-		}
-	})
-
-	t.Run("falls back to XDG data dir when nothing else is set", func(t *testing.T) {
-		savedCfg := cfg
-		t.Cleanup(func() { cfg = savedCfg })
-		cfg.LikesDB = ""
-		t.Setenv("SONOS_LIKES_DB", "")
-		t.Setenv("XDG_DATA_HOME", "/xdg-data")
-
-		got, err := likesDBPath("")
-		if err != nil {
-			t.Fatalf("likesDBPath: %v", err)
-		}
-		want := filepath.Join("/xdg-data", "sonoplay", "likes.db")
-		if got != want {
-			t.Errorf("likesDBPath = %q, want %q", got, want)
-		}
-	})
-}
-
-func TestUserDataDirFallsBackToHomeLocalShare(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", "")
-	t.Setenv("HOME", "/home/testuser")
-
-	got, err := userDataDir()
-	if err != nil {
-		t.Fatalf("userDataDir: %v", err)
-	}
-	want := filepath.Join("/home/testuser", ".local", "share")
-	if got != want {
-		t.Errorf("userDataDir() = %q, want %q", got, want)
 	}
 }
