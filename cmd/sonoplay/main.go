@@ -2907,6 +2907,87 @@ func runLike(args []string) {
 	fmt.Printf("liked %d track(s)\n", liked)
 }
 
+func runUnlike(args []string) {
+	fs := flag.NewFlagSet("unlike", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s unlike [--ip <speaker-ip>] [--db <path>] [-y|--yes] [<selector> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nRemoves a song from the \"likes\" database (see '%s like -h'). This\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "removes ALL of that song's like history, not just its most recent\n")
+		fmt.Fprintf(os.Stderr, "like - a song liked three times is fully unliked in one 'unlike', not\n")
+		fmt.Fprintf(os.Stderr, "left with two likes remaining.\n")
+		fmt.Fprintf(os.Stderr, "\nWith no <selector> arguments, unlikes whatever is currently playing\n")
+		fmt.Fprintf(os.Stderr, "(whether or not it's part of the saved queue).\n")
+		fmt.Fprintf(os.Stderr, "\nWith <selector> arguments, unlikes the matched/selected tracks in the\n")
+		fmt.Fprintf(os.Stderr, "current play queue instead. Positions are 1-based, matching\n")
+		fmt.Fprintf(os.Stderr, "'%s list' output. Each <selector> is one of:\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  N         a single queue position, e.g. \"5\"\n")
+		fmt.Fprintf(os.Stderr, "  A-B       an inclusive range, e.g. \"1-9\"\n")
+		fmt.Fprintf(os.Stderr, "  A..B      same as A-B, e.g. \"1..9\"\n")
+		fmt.Fprintf(os.Stderr, "  A-        from A to the end of the queue, e.g. \"9-\"\n")
+		fmt.Fprintf(os.Stderr, "  @word...  every track matching a '%s find'-style search, e.g. \"@amazing grace\"\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSeveral @-selectors narrow the search rather than searching\n")
+		fmt.Fprintf(os.Stderr, "separately, the same AND semantics as remove/bump; an @pattern\n")
+		fmt.Fprintf(os.Stderr, "matching more than one track requires -y/--yes to confirm unliking\n")
+		fmt.Fprintf(os.Stderr, "all of them.\n")
+		fmt.Fprintf(os.Stderr, "\nUnliking a song that was never liked is reported, not an error.\n")
+		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
+		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n")
+		fmt.Fprintf(os.Stderr, "  --db  SONOS_LIKES_DB    likes_db\n\n")
+		fs.PrintDefaults()
+	}
+
+	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	dbFlag := fs.String("db", "", "override the likes database path")
+	var yes bool
+	fs.BoolVar(&yes, "yes", false, "don't require confirmation when an @pattern selector matches multiple tracks")
+	fs.BoolVar(&yes, "y", false, "shorthand for --yes")
+	fs.Parse(args)
+
+	requireIP(fs, *ip)
+
+	db := openLikesDBOrExit(*dbFlag)
+	defer db.Close()
+
+	targets := resolveLikeTargets(*ip, fs.Args(), yes, "unlike")
+
+	if len(targets) == 1 && targets[0].position == 0 {
+		t := targets[0].track
+		removed, err := deleteLikes(db, t.URI)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		if removed > 0 {
+			fmt.Println("unliked:", formatTrack(t))
+		} else {
+			fmt.Println("not liked:", formatTrack(t))
+		}
+		return
+	}
+
+	unliked, notLiked := 0, 0
+	for _, tgt := range targets {
+		t := tgt.track
+		removed, err := deleteLikes(db, t.URI)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: unliked %d track(s) before failing: %v\n", unliked, err)
+			os.Exit(1)
+		}
+		if removed > 0 {
+			fmt.Printf("unliked %3d. %s\n", tgt.position, formatTrack(t))
+			unliked++
+		} else {
+			fmt.Printf("not liked %3d. %s\n", tgt.position, formatTrack(t))
+			notLiked++
+		}
+	}
+	if notLiked == 0 {
+		fmt.Printf("unliked %d track(s)\n", unliked)
+	} else {
+		fmt.Printf("unliked %d track(s) (%d weren't liked)\n", unliked, notLiked)
+	}
+}
+
 func printTopUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s <command> [flags] [args]\n\n", os.Args[0])
 	fmt.Fprintln(os.Stderr, "Commands:")
@@ -2922,6 +3003,7 @@ func printTopUsage() {
 		{"find, f", "search the queue by title/artist/album/file name"},
 		{"bump, up-next", "move matched/selected tracks to play right after the current track"},
 		{"like", "like the current track, or matched/selected queue tracks"},
+		{"unlike", "remove the current or matched/selected tracks from likes"},
 		{"status, s", "show transport state, volume, and now playing"},
 		{"next, n", "skip to the next track"},
 		{"prev, previous, p", "skip to the previous track"},
@@ -2970,6 +3052,8 @@ func main() {
 		runBump(os.Args[2:])
 	case "like":
 		runLike(os.Args[2:])
+	case "unlike":
+		runUnlike(os.Args[2:])
 	case "status", "s":
 		runStatus(os.Args[2:])
 	case "next", "n":
