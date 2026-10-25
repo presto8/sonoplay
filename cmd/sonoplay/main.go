@@ -2918,7 +2918,7 @@ func openDBOrExit(dbFlagValue string) *sql.DB {
 func runLike(args []string) {
 	fs := flag.NewFlagSet("like", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s like [--ip <speaker-ip>] [--db <path>] [-y|--yes] [<selector> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s like [--ip <speaker-ip>] [--db <path>] [-y|--yes] [--last|<selector> ...]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nRecords a song in a persistent \"likes\" database (separate from, and\n")
 		fmt.Fprintf(os.Stderr, "surviving, the speaker's play queue), for later listing or replay\n")
 		fmt.Fprintf(os.Stderr, "with '%s likes'.\n", os.Args[0])
@@ -2945,6 +2945,10 @@ func runLike(args []string) {
 		fmt.Fprintf(os.Stderr, "fine for ordinary files and streams, but special per-service metadata\n")
 		fmt.Fprintf(os.Stderr, "(e.g. Spotify) isn't preserved, so such liked tracks may not replay\n")
 		fmt.Fprintf(os.Stderr, "correctly with '%s likes --play'.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\n--last likes the previous song from play history (see '%s history')\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "- the most recent play that isn't the current track - instead of\n")
+		fmt.Fprintf(os.Stderr, "what's currently playing or a selector; can't be combined with\n")
+		fmt.Fprintf(os.Stderr, "selector arguments.\n")
 		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
 		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n")
 		fmt.Fprintf(os.Stderr, "  --db  SONOS_DB          db\n\n")
@@ -2953,15 +2957,52 @@ func runLike(args []string) {
 
 	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
 	dbFlag := fs.String("db", "", "override the likes database path")
-	var yes bool
+	var yes, last bool
 	fs.BoolVar(&yes, "yes", false, "don't require confirmation when an @pattern selector matches multiple tracks")
 	fs.BoolVar(&yes, "y", false, "shorthand for --yes")
+	fs.BoolVar(&last, "last", false, "like the previous song from play history, instead of what's currently playing or a selector")
 	fs.Parse(args)
 
 	requireIP(fs, *ip)
 
+	if last && fs.NArg() > 0 {
+		fmt.Fprintln(os.Stderr, "error: --last can't be combined with a selector")
+		fs.Usage()
+		os.Exit(2)
+	}
+
 	db := openDBOrExit(*dbFlag)
 	defer db.Close()
+
+	if last {
+		// Best-effort: find out what's currently playing (if anything)
+		// so it can be excluded from "the previous song" - if this
+		// fails for any reason, just proceed without excluding
+		// anything, rather than failing --last entirely over it.
+		currentURI := ""
+		if pos, err := getPositionInfo(*ip); err == nil {
+			track, _ := parseDIDLItem(pos.TrackMetaData)
+			if track.URI == "" {
+				track.URI = pos.TrackURI
+			}
+			currentURI = track.URI
+		}
+		p, ok, err := mostRecentPlay(db, currentURI)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		if !ok {
+			fmt.Fprintln(os.Stderr, "error: no play history yet")
+			os.Exit(1)
+		}
+		if err := addLike(db, p.URI, p.Title, p.Artist, p.Album); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		fmt.Println("liked:", formatTrack(queueTrack{Title: p.Title, Artist: p.Artist, Album: p.Album}))
+		return
+	}
 
 	targets := resolveLikeTargets(*ip, fs.Args(), yes, "like")
 
@@ -3234,6 +3275,152 @@ func runLikes(args []string) {
 	}
 }
 
+// likedURISet returns the set of every liked song's URI, for ♥-marking
+// play-history rows (see historyPlayLine/topPlayedLine). Built once per
+// command invocation rather than querying per-row.
+func likedURISet(db *sql.DB) (map[string]bool, error) {
+	songs, err := listLikedSongs(db)
+	if err != nil {
+		return nil, err
+	}
+	liked := make(map[string]bool, len(songs))
+	for _, s := range songs {
+		liked[s.URI] = true
+	}
+	return liked, nil
+}
+
+// historyPlayLine renders one listPlays row for "history": a ♥ marker if
+// the song is liked, when it was played, and the track itself.
+func historyPlayLine(p play, liked bool) string {
+	marker := "  "
+	if liked {
+		marker = "♥ "
+	}
+	return fmt.Sprintf("%s%s  %s", marker, p.PlayedAt.Local().Format("2006-01-02 15:04:05"),
+		formatTrack(queueTrack{Title: p.Title, Artist: p.Artist, Album: p.Album}))
+}
+
+// topPlayedLine renders one topPlayed row for "history --top": a ♥
+// marker if liked, the play count, and the track itself.
+func topPlayedLine(c playCount, liked bool) string {
+	marker := "  "
+	if liked {
+		marker = "♥ "
+	}
+	return fmt.Sprintf("%s%2dx  %s", marker, c.PlayCount,
+		formatTrack(queueTrack{Title: c.Title, Artist: c.Artist, Album: c.Album}))
+}
+
+// parseSinceFlag parses the --since flag for "history": "" (no filter,
+// returns the zero time.Time), "today" (local midnight today), a bare
+// "YYYY-MM-DD" date (local midnight that day), or a Go duration (e.g.
+// "24h", "2h30m" - ago from now). Go's time.ParseDuration doesn't
+// understand "d"/"w" units, so those aren't accepted here either; use
+// "24h"/"168h" or a specific date instead.
+func parseSinceFlag(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if s == "today" {
+		now := time.Now()
+		y, m, d := now.Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, now.Location()), nil
+	}
+	if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
+		return t, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf(`invalid --since %q: want "today", a date like "2026-01-02", or a duration like "24h"`, s)
+}
+
+func runHistory(args []string) {
+	fs := flag.NewFlagSet("history", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s history [--db <path>] [-n <count>|--all] [--since <when>] [--top]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nShows songs recorded by '%s play' (most recently played first) - only\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "a single song explicitly started playing right now is ever recorded;\n")
+		fmt.Fprintf(os.Stderr, "see '%s play -h' for exactly what that covers and what's excluded.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "A ♥ marks a song that's also in your likes (see '%s likes').\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\n  -n, --count <n>  how many plays to show (default 20)\n")
+		fmt.Fprintf(os.Stderr, "  --all            show all plays, ignoring --count\n")
+		fmt.Fprintf(os.Stderr, "  --since <when>   only plays at/after <when>: \"today\", a date like\n")
+		fmt.Fprintf(os.Stderr, "                   \"2026-01-02\", or a duration like \"24h\" (ago)\n")
+		fmt.Fprintf(os.Stderr, "  --top            show the most-played songs (with play counts)\n")
+		fmt.Fprintf(os.Stderr, "                   instead of a chronological list; --count/--all\n")
+		fmt.Fprintf(os.Stderr, "                   still apply, --since does not\n")
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s history\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s history --since today\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s history --top\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
+		fmt.Fprintf(os.Stderr, "  --db  SONOS_DB  db\n\n")
+		fs.PrintDefaults()
+	}
+
+	dbFlag := fs.String("db", "", "override the play-history database path")
+	var count int
+	var all, top bool
+	var since string
+	fs.IntVar(&count, "count", 20, "how many plays to show")
+	fs.IntVar(&count, "n", 20, "shorthand for --count")
+	fs.BoolVar(&all, "all", false, "show all plays, ignoring --count")
+	fs.BoolVar(&top, "top", false, "show the most-played songs instead of a chronological list")
+	fs.StringVar(&since, "since", "", `only plays at/after this time: "today", a date, or a duration like "24h"`)
+	fs.Parse(args)
+
+	sinceTime, err := parseSinceFlag(since)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+
+	limit := count
+	if all {
+		limit = 0
+	}
+
+	db := openDBOrExit(*dbFlag)
+	defer db.Close()
+
+	liked, err := likedURISet(db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+
+	if top {
+		ranked, err := topPlayed(db, limit)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		if len(ranked) == 0 {
+			fmt.Println("no plays recorded yet")
+			return
+		}
+		for _, c := range ranked {
+			fmt.Println(topPlayedLine(c, liked[c.URI]))
+		}
+		return
+	}
+
+	plays, err := listPlays(db, limit, sinceTime)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	if len(plays) == 0 {
+		fmt.Println("no plays recorded yet")
+		return
+	}
+	for _, p := range plays {
+		fmt.Println(historyPlayLine(p, liked[p.URI]))
+	}
+}
+
 func printTopUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s <command> [flags] [args]\n\n", os.Args[0])
 	fmt.Fprintln(os.Stderr, "Commands:")
@@ -3251,6 +3438,7 @@ func printTopUsage() {
 		{"like", "like the current track, or matched/selected queue tracks"},
 		{"unlike", "remove the current or matched/selected tracks from likes"},
 		{"likes", "list liked songs (--play to queue/play them all)"},
+		{"history", "show play history (--top for most-played)"},
 		{"status, s", "show transport state, volume, and now playing"},
 		{"next, n", "skip to the next track"},
 		{"prev, previous, p", "skip to the previous track"},
@@ -3303,6 +3491,8 @@ func main() {
 		runUnlike(os.Args[2:])
 	case "likes":
 		runLikes(os.Args[2:])
+	case "history":
+		runHistory(os.Args[2:])
 	case "status", "s":
 		runStatus(os.Args[2:])
 	case "next", "n":

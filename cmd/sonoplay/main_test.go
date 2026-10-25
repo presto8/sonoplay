@@ -813,3 +813,139 @@ func TestVisibleWindow(t *testing.T) {
 		})
 	}
 }
+
+func TestIsSingleSpotifyTrack(t *testing.T) {
+	cases := []struct {
+		name  string
+		items []playItem
+		want  bool
+	}{
+		{"single spotify track", []playItem{{Label: "spotify track abc123"}}, true},
+		{"single spotify album is not a track", []playItem{{Label: "spotify album abc123"}}, false},
+		{"single spotify playlist is not a track", []playItem{{Label: "spotify playlist abc123"}}, false},
+		{"single plain file is not spotify at all", []playItem{{Label: "red.mp3"}}, false},
+		{"empty items", nil, false},
+		{"multiple items, even if the first is a track", []playItem{{Label: "spotify track abc"}, {Label: "red.mp3"}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isSingleSpotifyTrack(c.items); got != c.want {
+				t.Errorf("isSingleSpotifyTrack(%+v) = %v, want %v", c.items, got, c.want)
+			}
+		})
+	}
+}
+
+func TestParseSinceFlag(t *testing.T) {
+	t.Run("empty string means no filter", func(t *testing.T) {
+		got, err := parseSinceFlag("")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !got.IsZero() {
+			t.Errorf("parseSinceFlag(\"\") = %v, want the zero time", got)
+		}
+	})
+
+	t.Run("today is local midnight today", func(t *testing.T) {
+		got, err := parseSinceFlag("today")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		wantY, wantM, wantD := time.Now().Date()
+		gotY, gotM, gotD := got.Date()
+		if gotY != wantY || gotM != wantM || gotD != wantD {
+			t.Errorf("parseSinceFlag(\"today\") date = %04d-%02d-%02d, want %04d-%02d-%02d", gotY, gotM, gotD, wantY, wantM, wantD)
+		}
+		if got.Hour() != 0 || got.Minute() != 0 || got.Second() != 0 {
+			t.Errorf("parseSinceFlag(\"today\") = %v, want midnight", got)
+		}
+	})
+
+	t.Run("bare date is local midnight that day", func(t *testing.T) {
+		got, err := parseSinceFlag("2026-03-15")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		y, m, d := got.Date()
+		if y != 2026 || m != time.March || d != 15 {
+			t.Errorf("parseSinceFlag(\"2026-03-15\") date = %04d-%02d-%02d, want 2026-03-15", y, m, d)
+		}
+		if got.Hour() != 0 || got.Minute() != 0 {
+			t.Errorf("parseSinceFlag(\"2026-03-15\") = %v, want midnight", got)
+		}
+	})
+
+	t.Run("duration is that long ago from now", func(t *testing.T) {
+		before := time.Now().Add(-24 * time.Hour)
+		got, err := parseSinceFlag("24h")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		after := time.Now().Add(-24 * time.Hour)
+		if got.Before(before) || got.After(after) {
+			t.Errorf("parseSinceFlag(\"24h\") = %v, want roughly %v", got, before)
+		}
+	})
+
+	t.Run("garbage is an error", func(t *testing.T) {
+		if _, err := parseSinceFlag("nonsense"); err == nil {
+			t.Error("expected an error, got nil")
+		}
+	})
+
+	t.Run("days unit is not supported (Go's ParseDuration doesn't have it)", func(t *testing.T) {
+		if _, err := parseSinceFlag("7d"); err == nil {
+			t.Error("expected an error for \"7d\", got nil")
+		}
+	})
+}
+
+func TestHistoryPlayLine(t *testing.T) {
+	p := play{
+		PlayedAt: time.Date(2026, 3, 2, 15, 4, 5, 0, time.UTC),
+		Title:    "Amazing Grace",
+		Artist:   "John Newton",
+		Album:    "Olney Hymns",
+	}
+
+	t.Run("not liked", func(t *testing.T) {
+		got := historyPlayLine(p, false)
+		want := "  " + p.PlayedAt.Local().Format("2006-01-02 15:04:05") + "  John Newton - Amazing Grace (Olney Hymns)"
+		if got != want {
+			t.Errorf("historyPlayLine(_, false) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("liked", func(t *testing.T) {
+		got := historyPlayLine(p, true)
+		want := "\u2665 " + p.PlayedAt.Local().Format("2006-01-02 15:04:05") + "  John Newton - Amazing Grace (Olney Hymns)"
+		if got != want {
+			t.Errorf("historyPlayLine(_, true) = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestTopPlayedLine(t *testing.T) {
+	c := playCount{
+		Title:     "Amazing Grace",
+		Artist:    "John Newton",
+		PlayCount: 5,
+	}
+
+	t.Run("not liked", func(t *testing.T) {
+		got := topPlayedLine(c, false)
+		want := "   5x  John Newton - Amazing Grace"
+		if got != want {
+			t.Errorf("topPlayedLine(_, false) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("liked", func(t *testing.T) {
+		got := topPlayedLine(c, true)
+		want := "\u2665  5x  John Newton - Amazing Grace"
+		if got != want {
+			t.Errorf("topPlayedLine(_, true) = %q, want %q", got, want)
+		}
+	})
+}
