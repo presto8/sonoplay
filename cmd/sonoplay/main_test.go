@@ -278,8 +278,8 @@ func TestResolveSelectors(t *testing.T) {
 		if !intsEqual(pos, []int{2}) {
 			t.Errorf("positions = %v, want [2]", pos)
 		}
-		if len(hits) != 1 || hits[0].pattern != "beta" || !intsEqual(hits[0].positions, []int{2}) {
-			t.Errorf("patternHits = %+v, want one hit for %q matching [2]", hits, "beta")
+		if len(hits) != 1 || hits[0].pattern != "@beta" || !intsEqual(hits[0].positions, []int{2}) {
+			t.Errorf("patternHits = %+v, want one hit for %q matching [2]", hits, "@beta")
 		}
 	})
 
@@ -292,8 +292,8 @@ func TestResolveSelectors(t *testing.T) {
 		if !intsEqual(pos, wantPos) {
 			t.Errorf("positions = %v, want %v", pos, wantPos)
 		}
-		if len(hits) != 1 || hits[0].pattern != "song" || !intsEqual(hits[0].positions, wantPos) {
-			t.Errorf("patternHits = %+v, want one hit for %q matching %v", hits, "song", wantPos)
+		if len(hits) != 1 || hits[0].pattern != "@song" || !intsEqual(hits[0].positions, wantPos) {
+			t.Errorf("patternHits = %+v, want one hit for %q matching %v", hits, "@song", wantPos)
 		}
 	})
 
@@ -308,8 +308,8 @@ func TestResolveSelectors(t *testing.T) {
 		if !intsEqual(pos, wantPos) {
 			t.Errorf("positions = %v, want %v", pos, wantPos)
 		}
-		if len(hits) != 1 || hits[0].pattern != "alpha" || !intsEqual(hits[0].positions, []int{1, 3}) {
-			t.Errorf("patternHits = %+v, want one hit for %q matching [1 3]", hits, "alpha")
+		if len(hits) != 1 || hits[0].pattern != "@alpha" || !intsEqual(hits[0].positions, []int{1, 3}) {
+			t.Errorf("patternHits = %+v, want one hit for %q matching [1 3]", hits, "@alpha")
 		}
 	})
 
@@ -338,6 +338,61 @@ func TestResolveSelectors(t *testing.T) {
 		_, _, err := resolveSelectors([]string{"@nonexistent"}, tracks)
 		if err == nil {
 			t.Fatal("expected an error, got nil")
+		}
+	})
+
+	t.Run("multiple @ selectors narrow the search (AND), not search separately (OR)", func(t *testing.T) {
+		// "@song" alone matches [1 2 4 5]; "@alpha" alone matches [1 3].
+		// Combined, only track 1 ("Alpha Song") contains both words, so
+		// "@song @alpha" must narrow to [1], not union to [1 2 3 4 5].
+		pos, hits, err := resolveSelectors([]string{"@song", "@alpha"}, tracks)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !intsEqual(pos, []int{1}) {
+			t.Errorf("positions = %v, want [1]", pos)
+		}
+		if len(hits) != 1 || hits[0].pattern != "@song @alpha" || !intsEqual(hits[0].positions, []int{1}) {
+			t.Errorf("patternHits = %+v, want one combined hit for %q matching [1]", hits, "@song @alpha")
+		}
+	})
+
+	t.Run("multiple @ selectors give the same result as one combined pattern", func(t *testing.T) {
+		separate, _, err := resolveSelectors([]string{"@song", "@alpha"}, tracks)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		combined, _, err := resolveSelectors([]string{"@song alpha"}, tracks)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !intsEqual(separate, combined) {
+			t.Errorf("resolveSelectors([@song, @alpha]) = %v, want same as resolveSelectors([@song alpha]) = %v", separate, combined)
+		}
+	})
+
+	t.Run("multiple @ selectors with no combined match is an error", func(t *testing.T) {
+		// "@song" alone matches several tracks, but none of them also
+		// contain "nonexistent", so the combined (AND) search matches
+		// nothing - this must still be an error, not an empty result.
+		_, _, err := resolveSelectors([]string{"@song", "@nonexistent"}, tracks)
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+	})
+
+	t.Run("a number plus multiple @ selectors unions the number with the combined search", func(t *testing.T) {
+		// "@song @alpha" narrows to [1]; "2" is unrelated and simply
+		// added on top (numbers/ranges union, they don't narrow).
+		pos, hits, err := resolveSelectors([]string{"2", "@song", "@alpha"}, tracks)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !intsEqual(pos, []int{1, 2}) {
+			t.Errorf("positions = %v, want [1 2]", pos)
+		}
+		if len(hits) != 1 || hits[0].pattern != "@song @alpha" {
+			t.Errorf("patternHits = %+v, want one combined hit for %q", hits, "@song @alpha")
 		}
 	})
 
@@ -373,6 +428,37 @@ func TestResolveSelectors(t *testing.T) {
 			t.Errorf("patternHits = %v, want empty", hits)
 		}
 	})
+}
+
+func TestClassifyPlayArgs(t *testing.T) {
+	cases := []struct {
+		name         string
+		args         []string
+		wantSelector bool
+		wantMixed    bool
+	}{
+		{"empty args", nil, false, false},
+		{"single plain number", []string{"3"}, true, false},
+		{"single @pattern", []string{"@foo"}, true, false},
+		{"multiple @patterns only", []string{"@foo", "@bar"}, true, false},
+		{"multiple plain numbers only", []string{"3", "7"}, true, false},
+		{"number combined with @patterns", []string{"3", "@foo", "@bar"}, true, false},
+		{"single file (no @, not a number)", []string{"song.mp3"}, false, false},
+		{"multiple files, no @", []string{"song.mp3", "other.mp3"}, false, false},
+		{"number plus file, no @ - unchanged pre-existing behavior", []string{"3", "song.mp3"}, false, false},
+		{"@pattern mixed with a file is an error", []string{"@foo", "song.mp3"}, false, true},
+		{"@pattern mixed with a URL is an error", []string{"@foo", "http://host/song.mp3"}, false, true},
+		{"@pattern, a number, and a file: still an error", []string{"@foo", "3", "song.mp3"}, false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			selector, mixed := classifyPlayArgs(c.args)
+			if selector != c.wantSelector || mixed != c.wantMixed {
+				t.Errorf("classifyPlayArgs(%v) = (selector=%v, mixed=%v), want (selector=%v, mixed=%v)",
+					c.args, selector, mixed, c.wantSelector, c.wantMixed)
+			}
+		})
+	}
 }
 
 func TestAmbiguousPatternHits(t *testing.T) {

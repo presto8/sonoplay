@@ -86,6 +86,14 @@ sonoplay rm @amazing
 sonoplay bump @amazing
 ```
 
+Several `@pattern` arguments narrow the search further rather than
+searching separately: `@foo @bar` matches tracks containing both foo and
+bar (the same as `@"foo bar"`), not foo or bar:
+
+```
+sonoplay play @newton @grace
+```
+
 If `@pattern` matches more than one track, `play` requires `--first` to
 pick the first match, and `remove`/`bump` require `-y`/`--yes` to confirm
 acting on all of them; otherwise the matches are listed and nothing is

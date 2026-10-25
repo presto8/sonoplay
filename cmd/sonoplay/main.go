@@ -805,9 +805,11 @@ func matchQueue(tracks []queueTrack, words []string) []int {
 // matched per trackMatches.
 const selectorPatternPrefix = "@"
 
-// resolvePatternHit records how many tracks a single "@..." selector
-// matched, so callers can decide whether multiple matches need extra
-// confirmation (e.g. remove's -y flag).
+// resolvePatternHit records which tracks the combined "@..." search
+// resolveSelectors performed matched, so callers can decide whether
+// multiple matches need extra confirmation (e.g. remove's -y flag).
+// pattern is every "@..." selector given, space-joined, as typed
+// (including the "@"), e.g. "@foo @bar".
 type resolvePatternHit struct {
 	pattern   string
 	positions []int
@@ -816,30 +818,36 @@ type resolvePatternHit struct {
 // resolveSelectors parses a mix of position/range selectors (see
 // parseTrackRange: "5", "1-9", "1..9", "9-") and "@word..." search
 // selectors against tracks, returning every matching 1-based position,
-// sorted ascending with duplicates removed. patternHits reports, for each
-// "@..." selector given (in the order given), which positions it matched;
-// callers that want to require confirmation for a pattern matching more
-// than one track can inspect this. An "@..." selector matching no tracks,
-// or any selector with invalid syntax or an out-of-range position, is an
-// error - in neither case is a partial result returned.
+// sorted ascending with duplicates removed.
+//
+// Every "@..." selector given is combined into a single search: all of
+// their words together must match (AND), the same as if they'd been
+// written as one "@word1 word2 ..." selector. This means
+// "@foo @bar" and "@bar foo" and "@foo bar" all narrow to the same
+// tracks - matching ALL of foo and bar - rather than matching foo OR
+// bar. If that combined search matches no tracks, or any selector has
+// invalid syntax or an out-of-range position, resolveSelectors returns
+// an error and no partial result.
+//
+// patternHits reports the single combined "@..." search actually
+// performed (nil if no "@..." selector was given), and which positions
+// it matched, so callers can require extra confirmation (e.g. remove's
+// -y flag) when it matched more than one track. pattern is the "@..."
+// selector(s) exactly as given, space-joined, e.g. "@foo @bar".
 func resolveSelectors(args []string, tracks []queueTrack) (positions []int, patternHits []resolvePatternHit, err error) {
 	total := len(tracks)
 	selected := map[int]bool{}
 
+	var patternArgs []string
+	var words []string
 	for _, arg := range args {
 		if pattern, ok := strings.CutPrefix(arg, selectorPatternPrefix); ok {
-			words := strings.Fields(pattern)
-			if len(words) == 0 {
+			w := strings.Fields(pattern)
+			if len(w) == 0 {
 				return nil, nil, fmt.Errorf("empty search pattern %q", arg)
 			}
-			hits := matchQueue(tracks, words)
-			if len(hits) == 0 {
-				return nil, nil, fmt.Errorf("%q matched no tracks in the queue", arg)
-			}
-			patternHits = append(patternHits, resolvePatternHit{pattern: pattern, positions: hits})
-			for _, i := range hits {
-				selected[i] = true
-			}
+			patternArgs = append(patternArgs, arg)
+			words = append(words, w...)
 			continue
 		}
 
@@ -851,6 +859,18 @@ func resolveSelectors(args []string, tracks []queueTrack) (positions []int, patt
 			return nil, nil, fmt.Errorf("selector %q is out of range (queue has %d track(s))", arg, total)
 		}
 		for i := start; i <= end; i++ {
+			selected[i] = true
+		}
+	}
+
+	if len(patternArgs) > 0 {
+		combined := strings.Join(patternArgs, " ")
+		hits := matchQueue(tracks, words)
+		if len(hits) == 0 {
+			return nil, nil, fmt.Errorf("%q matched no tracks in the queue", combined)
+		}
+		patternHits = append(patternHits, resolvePatternHit{pattern: combined, positions: hits})
+		for _, i := range hits {
 			selected[i] = true
 		}
 	}
@@ -897,7 +917,7 @@ func confirmMultiMatchOrExit(patternHits []resolvePatternHit, yes bool, tracks [
 		return
 	}
 	for _, hit := range ambiguous {
-		fmt.Fprintf(os.Stderr, "error: \"@%s\" matched more than one track:\n", hit.pattern)
+		fmt.Fprintf(os.Stderr, "error: %q matched more than one track:\n", hit.pattern)
 		for _, p := range hit.positions {
 			fmt.Fprintln(os.Stderr, formatQueueRow(p, tracks[p-1], p-1 == matched, pos))
 		}
@@ -1609,6 +1629,48 @@ func requireIP(fs *flag.FlagSet, ip string) {
 	}
 }
 
+// classifyPlayArgs decides whether runPlay's arguments should be resolved
+// as queue selectors (see resolveSelectors) rather than as files/URLs/
+// Spotify links. An argument is "selector-like" if it's a bare positive
+// integer (a queue position) or starts with "@" (a search pattern); any
+// mix of those, in any combination and however many, counts.
+//
+//   - If every argument is selector-like, selector is true: this covers
+//     both the historical single-plain-number case ("play 3") and any
+//     combination of numbers and/or "@pattern"s ("play @foo",
+//     "play 3 @foo @bar").
+//   - If at least one argument starts with "@" but at least one other
+//     argument is NOT selector-like (e.g. a file path, URL, or Spotify
+//     link), mixed is true: there's no sensible way to both search the
+//     queue and queue a file in one command, so this is reported as an
+//     error rather than silently treating the "@..." argument as a file
+//     name (which is what happened before this check existed).
+//   - Otherwise (no "@" arguments at all, i.e. this is the pre-existing
+//     "possibly several file/URL arguments, with plain numbers among
+//     them treated as literal file names" case) both are false, and
+//     runPlay's existing file/URL/Spotify-link handling is unchanged.
+func classifyPlayArgs(args []string) (selector, mixed bool) {
+	if len(args) == 0 {
+		return false, false
+	}
+	allSelectorLike := true
+	anyPattern := false
+	for _, a := range args {
+		switch {
+		case strings.HasPrefix(a, selectorPatternPrefix):
+			anyPattern = true
+		case isPositiveInteger(a):
+			// Also selector-like; allSelectorLike unchanged.
+		default:
+			allSelectorLike = false
+		}
+	}
+	if allSelectorLike {
+		return true, false
+	}
+	return false, anyPattern
+}
+
 func runPlay(args []string) {
 	fs := flag.NewFlagSet("play", flag.ExitOnError)
 	fs.Usage = func() {
@@ -1620,12 +1682,19 @@ func runPlay(args []string) {
 		fmt.Fprintf(os.Stderr, "\nIf a single argument is a plain positive number (e.g. \"3\"), it's\n")
 		fmt.Fprintf(os.Stderr, "treated as a 1-based position in the current queue (see '%s list'):\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "the speaker switches to its queue, jumps to that item, and plays it\n")
-		fmt.Fprintf(os.Stderr, "immediately. (Only applies with exactly one numeric argument.)\n")
-		fmt.Fprintf(os.Stderr, "\nA single argument starting with \"@\" (e.g. \"@amazing grace\") is treated\n")
-		fmt.Fprintf(os.Stderr, "the same way, but resolved by searching the queue (see '%s find') rather\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "than by position. If it matches more than one track, that's an error\n")
-		fmt.Fprintf(os.Stderr, "unless --first is given, in which case the first (lowest-positioned)\n")
-		fmt.Fprintf(os.Stderr, "match is played.\n")
+		fmt.Fprintf(os.Stderr, "immediately.\n")
+		fmt.Fprintf(os.Stderr, "\nArguments starting with \"@\" (e.g. \"@amazing grace\") are resolved the\n")
+		fmt.Fprintf(os.Stderr, "same way, but by searching the queue (see '%s find') rather than by\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "position. Several \"@...\" arguments narrow the search further rather\n")
+		fmt.Fprintf(os.Stderr, "than searching separately: \"play @foo @bar\" means every word of foo\n")
+		fmt.Fprintf(os.Stderr, "AND bar must match (the same as \"play @\\\"foo bar\\\"\"), not foo OR bar.\n")
+		fmt.Fprintf(os.Stderr, "A plain number may be combined with \"@...\" arguments too, adding that\n")
+		fmt.Fprintf(os.Stderr, "position to the search results.\n")
+		fmt.Fprintf(os.Stderr, "\nThese selector forms only apply when EVERY argument is one of them -\n")
+		fmt.Fprintf(os.Stderr, "mixing an \"@...\" argument with a file/URL/Spotify-link argument is an\n")
+		fmt.Fprintf(os.Stderr, "error, not a guess. If the (possibly combined) selectors match more\n")
+		fmt.Fprintf(os.Stderr, "than one track, that's an error unless --first is given, in which\n")
+		fmt.Fprintf(os.Stderr, "case the first (lowest-positioned) match is played.\n")
 		fmt.Fprintf(os.Stderr, "\nOtherwise, each argument is resolved independently: if it contains\n")
 		fmt.Fprintf(os.Stderr, "\"://\" it's played as-is; else if --dest-dir is set it's treated as a\n")
 		fmt.Fprintf(os.Stderr, "local file path that gets copied into --dest-dir (transcoded to mp3\n")
@@ -1663,21 +1732,27 @@ func runPlay(args []string) {
 		os.Exit(2)
 	}
 
-	// Single argument that's either a plain queue position (e.g. "3") or
-	// an "@pattern" search selector (e.g. "@amazing grace"): resolve it
+	// Arguments that are all queue selectors (plain queue position(s)
+	// and/or "@pattern" search(es), see classifyPlayArgs): resolve them
 	// against the current queue and jump straight to the result, rather
-	// than treating it as a file/URL argument. Both forms go through
-	// resolveSelectors so there's one code path instead of two divergent
-	// ones; a bare number only ever resolves to itself (already
-	// range-checked by resolveSelectors), while "@pattern" may resolve
-	// to more than one position.
-	if fs.NArg() == 1 && (isPositiveInteger(fs.Arg(0)) || strings.HasPrefix(fs.Arg(0), selectorPatternPrefix)) {
+	// than treating them as file/URL arguments. Several "@..." arguments
+	// combine into a single search requiring all of their words to match
+	// (see resolveSelectors), e.g. "play @foo @bar" narrows to tracks
+	// matching both foo and bar, the same as "play @\"foo bar\"".
+	selectorArgs, mixedArgs := classifyPlayArgs(fs.Args())
+	if mixedArgs {
+		fmt.Fprintln(os.Stderr, "error: can't mix @patterns with files/URLs")
+		os.Exit(2)
+	}
+	if selectorArgs {
+		label := strings.Join(fs.Args(), " ")
+
 		tracks, _, err := browseQueue(*ip, 0)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
-		positions, _, err := resolveSelectors([]string{fs.Arg(0)}, tracks)
+		positions, _, err := resolveSelectors(fs.Args(), tracks)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
@@ -1685,7 +1760,7 @@ func runPlay(args []string) {
 
 		index := positions[0] // lowest-positioned match; the only one unless an @pattern matched several
 		if len(positions) > 1 && !*first {
-			fmt.Fprintf(os.Stderr, "error: %q matches more than one track:\n", fs.Arg(0))
+			fmt.Fprintf(os.Stderr, "error: %q matches more than one track:\n", label)
 			matched, pos, _ := currentQueuePosition(*ip, tracks)
 			for _, p := range positions {
 				fmt.Fprintln(os.Stderr, formatQueueRow(p, tracks[p-1], p-1 == matched, pos))
@@ -2156,6 +2231,10 @@ func runRemove(args []string) {
 		fmt.Fprintf(os.Stderr, "  A..B      same as A-B, e.g. \"1..9\"\n")
 		fmt.Fprintf(os.Stderr, "  A-        from A to the end of the queue, e.g. \"9-\"\n")
 		fmt.Fprintf(os.Stderr, "  @word...  every track matching a '%s find'-style search, e.g. \"@amazing grace\"\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSeveral @-selectors narrow the search rather than searching\n")
+		fmt.Fprintf(os.Stderr, "separately: \"@foo @bar\" matches tracks containing both foo and bar\n")
+		fmt.Fprintf(os.Stderr, "(the same as \"@\\\"foo bar\\\"\"), not foo or bar. Number/range selectors\n")
+		fmt.Fprintf(os.Stderr, "add to the result instead of narrowing it.\n")
 		fmt.Fprintf(os.Stderr, "\nAn @pattern selector matching more than one track requires -y/--yes\n")
 		fmt.Fprintf(os.Stderr, "to confirm removing all of them; the matches are listed so you can\n")
 		fmt.Fprintf(os.Stderr, "check before re-running with -y. Plain number/range selectors never\n")
@@ -2269,6 +2348,10 @@ func runBump(args []string) {
 		fmt.Fprintf(os.Stderr, "  A..B      same as A-B, e.g. \"1..9\"\n")
 		fmt.Fprintf(os.Stderr, "  A-        from A to the end of the queue, e.g. \"9-\"\n")
 		fmt.Fprintf(os.Stderr, "  @word...  every track matching a '%s find'-style search, e.g. \"@amazing grace\"\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSeveral @-selectors narrow the search rather than searching\n")
+		fmt.Fprintf(os.Stderr, "separately: \"@foo @bar\" matches tracks containing both foo and bar\n")
+		fmt.Fprintf(os.Stderr, "(the same as \"@\\\"foo bar\\\"\"), not foo or bar. Number/range selectors\n")
+		fmt.Fprintf(os.Stderr, "add to the result instead of narrowing it.\n")
 		fmt.Fprintf(os.Stderr, "\nAn @pattern selector matching more than one track requires -y/--yes\n")
 		fmt.Fprintf(os.Stderr, "to confirm bumping all of them; the matches are listed so you can\n")
 		fmt.Fprintf(os.Stderr, "check before re-running with -y. Plain number/range selectors never\n")
