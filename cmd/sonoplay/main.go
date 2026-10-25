@@ -2988,6 +2988,171 @@ func runUnlike(args []string) {
 	}
 }
 
+// likedSongLine renders one listLikedSongs row for "likes": its total
+// like count, when it was last liked, and its track info.
+func likedSongLine(s likedSong) string {
+	return fmt.Sprintf("%2dx  %s  %s", s.LikeCount, s.LastLiked.Local().Format("2006-01-02 15:04"),
+		formatTrack(queueTrack{Title: s.Title, Artist: s.Artist, Album: s.Album}))
+}
+
+// likeEntryLine renders one listLikeHistory row for "likes --history":
+// its own timestamp (not aggregated, unlike likedSongLine) and track
+// info.
+func likeEntryLine(e likeEntry) string {
+	return fmt.Sprintf("%s  %s", e.LikedAt.Local().Format("2006-01-02 15:04:05"),
+		formatTrack(queueTrack{Title: e.Title, Artist: e.Artist, Album: e.Album}))
+}
+
+func runLikes(args []string) {
+	fs := flag.NewFlagSet("likes", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s likes [--db <path>] [-n|--numbers-only] [--history] [--play [--now]] [--ip <ip>]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nLists songs recorded by '%s like' (most recently liked first), each\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "with its total like count and when it was last liked.\n")
+		fmt.Fprintf(os.Stderr, "\n-n/--history/--play are mutually exclusive (pick at most one):\n")
+		fmt.Fprintf(os.Stderr, "  -n, --numbers-only  print only each song's URI, one per line (for\n")
+		fmt.Fprintf(os.Stderr, "                      scripting, e.g. piping into another command);\n")
+		fmt.Fprintf(os.Stderr, "                      exits 1 if there are no liked songs, like find -n\n")
+		fmt.Fprintf(os.Stderr, "  --history           show every like event (not deduplicated by\n")
+		fmt.Fprintf(os.Stderr, "                      song - a song liked 3 times shows 3 times),\n")
+		fmt.Fprintf(os.Stderr, "                      newest first, each with its own timestamp\n")
+		fmt.Fprintf(os.Stderr, "  --play              queue every liked song and play them (most\n")
+		fmt.Fprintf(os.Stderr, "                      recently liked first); appends to the queue\n")
+		fmt.Fprintf(os.Stderr, "                      without interrupting playback unless --now (or\n")
+		fmt.Fprintf(os.Stderr, "                      nothing is currently playing) is given; a song\n")
+		fmt.Fprintf(os.Stderr, "                      that fails to queue is skipped with a message\n")
+		fmt.Fprintf(os.Stderr, "                      rather than aborting the rest\n")
+		fmt.Fprintf(os.Stderr, "\nNote: liked tracks are replayed by their bare URL/file, so special\n")
+		fmt.Fprintf(os.Stderr, "per-service metadata (e.g. Spotify) isn't preserved - see '%s like -h'.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s likes\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s likes --history\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s likes --play\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
+		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip        (only used with --play)\n")
+		fmt.Fprintf(os.Stderr, "  --db  SONOS_LIKES_DB    likes_db\n\n")
+		fs.PrintDefaults()
+	}
+
+	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address (only used with --play)")
+	dbFlag := fs.String("db", "", "override the likes database path")
+	var numbersOnly, history, play, now bool
+	fs.BoolVar(&numbersOnly, "numbers-only", false, "print only each song's URI, one per line")
+	fs.BoolVar(&numbersOnly, "n", false, "shorthand for --numbers-only")
+	fs.BoolVar(&history, "history", false, "show every like event instead of one row per song")
+	fs.BoolVar(&play, "play", false, "queue and play every liked song")
+	fs.BoolVar(&now, "now", false, "with --play, play immediately instead of appending to the queue")
+	fs.Parse(args)
+
+	if history && play {
+		fmt.Fprintln(os.Stderr, "error: --history and --play can't be combined")
+		fs.Usage()
+		os.Exit(2)
+	}
+	if numbersOnly && (history || play) {
+		fmt.Fprintln(os.Stderr, "error: -n/--numbers-only can't be combined with --history or --play")
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	db := openLikesDBOrExit(*dbFlag)
+	defer db.Close()
+
+	switch {
+	case history:
+		entries, err := listLikeHistory(db)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		if len(entries) == 0 {
+			fmt.Println("no liked songs yet")
+			return
+		}
+		for _, e := range entries {
+			fmt.Println(likeEntryLine(e))
+		}
+		return
+
+	case play:
+		requireIP(fs, *ip)
+
+		songs, err := listLikedSongs(db)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		if len(songs) == 0 {
+			fmt.Println("no liked songs yet")
+			return
+		}
+
+		firstTrackNumber := 0
+		queueLength := 0
+		queuedCount := 0
+		for _, s := range songs {
+			firstNum, newLength, err := addURIToQueue(*ip, s.URI, false)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "skipping %q: %v\n", formatTrack(queueTrack{Title: s.Title, Artist: s.Artist, Album: s.Album}), err)
+				continue
+			}
+			if queuedCount == 0 {
+				firstTrackNumber = firstNum
+			}
+			queueLength = newLength
+			queuedCount++
+		}
+
+		if queuedCount == 0 {
+			fmt.Fprintln(os.Stderr, "error: failed to queue any liked songs")
+			os.Exit(1)
+		}
+
+		playImmediately := now
+		if !playImmediately {
+			state, err := getTransportState(*ip)
+			playImmediately = err != nil || state != "PLAYING"
+		}
+
+		if !playImmediately {
+			fmt.Printf("speaker is already playing; queued %d liked song(s) (queue length: %d)\n", queuedCount, queueLength)
+			return
+		}
+
+		if err := playQueueIndex(*ip, firstTrackNumber); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("queued %d liked song(s) and started playing from item %d\n", queuedCount, firstTrackNumber)
+		return
+	}
+
+	// Default listing mode (also handles -n/--numbers-only).
+	songs, err := listLikedSongs(db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+
+	if numbersOnly {
+		if len(songs) == 0 {
+			os.Exit(1)
+		}
+		for _, s := range songs {
+			fmt.Println(s.URI)
+		}
+		return
+	}
+
+	if len(songs) == 0 {
+		fmt.Println("no liked songs yet")
+		return
+	}
+	for _, s := range songs {
+		fmt.Println(likedSongLine(s))
+	}
+}
+
 func printTopUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s <command> [flags] [args]\n\n", os.Args[0])
 	fmt.Fprintln(os.Stderr, "Commands:")
@@ -3004,6 +3169,7 @@ func printTopUsage() {
 		{"bump, up-next", "move matched/selected tracks to play right after the current track"},
 		{"like", "like the current track, or matched/selected queue tracks"},
 		{"unlike", "remove the current or matched/selected tracks from likes"},
+		{"likes", "list liked songs (--play to queue/play them all)"},
 		{"status, s", "show transport state, volume, and now playing"},
 		{"next, n", "skip to the next track"},
 		{"prev, previous, p", "skip to the previous track"},
@@ -3054,6 +3220,8 @@ func main() {
 		runLike(os.Args[2:])
 	case "unlike":
 		runUnlike(os.Args[2:])
+	case "likes":
+		runLikes(os.Args[2:])
 	case "status", "s":
 		runStatus(os.Args[2:])
 	case "next", "n":

@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 // intsEqual compares two int slices by content, treating nil and an
@@ -624,6 +625,36 @@ func TestBumpTargets(t *testing.T) {
 				t.Errorf("bumpTargets(%v, %d) dropped = %d, want %d", c.selected, c.currentPosition, dropped, c.wantDropped)
 			}
 		})
+	}
+}
+
+func TestLikedSongLine(t *testing.T) {
+	s := likedSong{
+		URI:       "http://host/a.mp3",
+		Title:     "Amazing Grace",
+		Artist:    "Traditional",
+		Album:     "Hymns",
+		LikeCount: 3,
+		LastLiked: time.Date(2024, 3, 2, 15, 4, 0, 0, time.UTC),
+	}
+	got := likedSongLine(s)
+	want := " 3x  " + s.LastLiked.Local().Format("2006-01-02 15:04") + "  Traditional - Amazing Grace (Hymns)"
+	if got != want {
+		t.Errorf("likedSongLine(%+v) = %q, want %q", s, got, want)
+	}
+}
+
+func TestLikeEntryLine(t *testing.T) {
+	e := likeEntry{
+		URI:     "http://host/a.mp3",
+		Title:   "Amazing Grace",
+		Artist:  "Traditional",
+		LikedAt: time.Date(2024, 3, 2, 15, 4, 5, 0, time.UTC),
+	}
+	got := likeEntryLine(e)
+	want := e.LikedAt.Local().Format("2006-01-02 15:04:05") + "  Traditional - Amazing Grace"
+	if got != want {
+		t.Errorf("likeEntryLine(%+v) = %q, want %q", e, got, want)
 	}
 }
 
