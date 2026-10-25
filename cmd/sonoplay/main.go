@@ -1699,14 +1699,20 @@ func visibleWindow(total, anchor, maxLines int) (start, end int, topEllipsis, bo
 func runList(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s list [--ip <speaker-ip>]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s list [--ip <speaker-ip>] [-a|--all]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nLists the speaker's play queue, marking the currently playing item.\n")
+		fmt.Fprintf(os.Stderr, "\nWhen run in a terminal, the list is shortened to fit the screen\n")
+		fmt.Fprintf(os.Stderr, "(with \"...\" rows marking hidden items). Piping or redirecting the\n")
+		fmt.Fprintf(os.Stderr, "output, or passing --all, always prints the entire queue.\n")
 		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
 		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n\n")
 		fs.PrintDefaults()
 	}
 
 	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	var all bool
+	fs.BoolVar(&all, "all", false, "show the entire queue, even if it doesn't fit the terminal")
+	fs.BoolVar(&all, "a", false, "shorthand for --all")
 	fs.Parse(args)
 
 	requireIP(fs, *ip)
@@ -1765,14 +1771,17 @@ func runList(args []string) {
 		extraLines++
 	}
 
-	// If stdin is a console and we can determine its size, truncate the
+	// If stdout is a terminal and we can determine its size, truncate the
 	// list to fit the screen (leaving a little room to spare), rather
 	// than dumping potentially hundreds of lines. The ellipsis rows below
-	// mark whichever ends got cut off.
+	// mark whichever ends got cut off. --all (or stdout not being a
+	// terminal, e.g. piped or redirected) always shows everything.
 	maxLines := len(tracks)
-	if _, rows, ok := terminalSize(os.Stdin.Fd()); ok {
-		if budget := rows - terminalMargin - terminalSafetyMargin(rows) - extraLines; budget < maxLines {
-			maxLines = budget
+	if !all {
+		if _, rows, ok := terminalSize(os.Stdout.Fd()); ok {
+			if budget := rows - terminalMargin - terminalSafetyMargin(rows) - extraLines; budget < maxLines {
+				maxLines = budget
+			}
 		}
 	}
 
@@ -2034,7 +2043,7 @@ func printTopUsage() {
 		{"mute-toggle, mute", "toggle mute state"},
 		{"mute-on", "mute the speaker"},
 		{"mute-off", "unmute the speaker"},
-		{"list, ls", "list the current play queue"},
+		{"list, ls", "list the current play queue (-a/--all for the full list)"},
 		{"remove, rm", "remove tracks from the play queue (e.g. \"rm 1 5 9\", \"rm 1-9\")"},
 		{"status", "show transport state, volume, and now playing"},
 		{"next, n", "skip to the next track"},

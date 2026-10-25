@@ -13,7 +13,7 @@ type unixWinsize struct {
 }
 
 // terminalSize reports the width and height of the terminal attached to fd
-// (e.g. os.Stdin.Fd()). ok is false if fd isn't a terminal, or its size
+// (e.g. os.Stdout.Fd()). ok is false if fd isn't a terminal, or its size
 // can't be determined for any other reason (no controlling terminal,
 // output redirected to a file/pipe, etc.) - callers should treat that as
 // "unknown, don't truncate".
