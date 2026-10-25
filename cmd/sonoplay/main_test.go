@@ -375,6 +375,64 @@ func TestResolveSelectors(t *testing.T) {
 	})
 }
 
+func TestAmbiguousPatternHits(t *testing.T) {
+	cases := []struct {
+		name string
+		hits []resolvePatternHit
+		want []resolvePatternHit
+	}{
+		{
+			name: "nil hits yields nil",
+			hits: nil,
+			want: nil,
+		},
+		{
+			name: "all single-match hits yields nil",
+			hits: []resolvePatternHit{
+				{pattern: "a", positions: []int{1}},
+				{pattern: "b", positions: []int{2}},
+			},
+			want: nil,
+		},
+		{
+			name: "one multi-match hit among single-match ones is kept, order preserved",
+			hits: []resolvePatternHit{
+				{pattern: "a", positions: []int{1}},
+				{pattern: "b", positions: []int{2, 3}},
+				{pattern: "c", positions: []int{4}},
+			},
+			want: []resolvePatternHit{
+				{pattern: "b", positions: []int{2, 3}},
+			},
+		},
+		{
+			name: "multiple multi-match hits are all kept, in order",
+			hits: []resolvePatternHit{
+				{pattern: "a", positions: []int{1, 2}},
+				{pattern: "b", positions: []int{3}},
+				{pattern: "c", positions: []int{4, 5}},
+			},
+			want: []resolvePatternHit{
+				{pattern: "a", positions: []int{1, 2}},
+				{pattern: "c", positions: []int{4, 5}},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ambiguousPatternHits(c.hits)
+			if len(got) != len(c.want) {
+				t.Fatalf("ambiguousPatternHits(%+v) = %+v, want %+v", c.hits, got, c.want)
+			}
+			for i := range got {
+				if got[i].pattern != c.want[i].pattern || !intsEqual(got[i].positions, c.want[i].positions) {
+					t.Errorf("ambiguousPatternHits(%+v)[%d] = %+v, want %+v", c.hits, i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestTerminalSafetyMargin(t *testing.T) {
 	cases := []struct {
 		rows int

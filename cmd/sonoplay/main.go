@@ -813,6 +813,49 @@ func resolveSelectors(args []string, tracks []queueTrack) (positions []int, patt
 	return positions, patternHits, nil
 }
 
+// ambiguousPatternHits returns the subset of patternHits (as returned by
+// resolveSelectors) whose "@pattern" selector matched more than one
+// track, preserving order. This is the pure decision logic behind
+// confirmMultiMatchOrExit, pulled out so it's testable without a live
+// speaker or the os.Exit side effect.
+func ambiguousPatternHits(patternHits []resolvePatternHit) []resolvePatternHit {
+	var ambiguous []resolvePatternHit
+	for _, hit := range patternHits {
+		if len(hit.positions) > 1 {
+			ambiguous = append(ambiguous, hit)
+		}
+	}
+	return ambiguous
+}
+
+// confirmMultiMatchOrExit checks patternHits (as returned by
+// resolveSelectors) for any "@pattern" selector that matched more than
+// one track. Plain number/range selectors never need confirmation, no
+// matter how many are given - only a search pattern can silently expand
+// to more tracks than the user may have expected. If yes is false and
+// any pattern matched multiple tracks, every such pattern's matches are
+// listed (via formatQueueRow, so the currently-playing row - if among
+// them - gets its usual marker) and the process exits 2 without the
+// caller's action (e.g. remove, bump) having touched the queue. verb
+// (e.g. "remove", "bump") is used in the printed instructions.
+func confirmMultiMatchOrExit(patternHits []resolvePatternHit, yes bool, tracks []queueTrack, matched int, pos positionInfo, verb string) {
+	if yes {
+		return
+	}
+	ambiguous := ambiguousPatternHits(patternHits)
+	if len(ambiguous) == 0 {
+		return
+	}
+	for _, hit := range ambiguous {
+		fmt.Fprintf(os.Stderr, "error: \"@%s\" matched more than one track:\n", hit.pattern)
+		for _, p := range hit.positions {
+			fmt.Fprintln(os.Stderr, formatQueueRow(p, tracks[p-1], p-1 == matched, pos))
+		}
+	}
+	fmt.Fprintf(os.Stderr, "pass -y/--yes to %s all of the above\n", verb)
+	os.Exit(2)
+}
+
 // setRelativeVolume adjusts the volume by adjustment (can be negative) and
 // returns the speaker's new volume (0-100).
 func setRelativeVolume(ip string, adjustment int) (int, error) {
@@ -2054,23 +2097,32 @@ func runList(args []string) {
 func runRemove(args []string) {
 	fs := flag.NewFlagSet("remove", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s remove [--ip <speaker-ip>] <selector> [<selector> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s remove [--ip <speaker-ip>] [-y|--yes] <selector> [<selector> ...]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nRemoves one or more tracks from the current play queue. Positions are\n")
 		fmt.Fprintf(os.Stderr, "1-based, matching '%s list' output.\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nEach <selector> is one of:\n")
-		fmt.Fprintf(os.Stderr, "  N      a single queue position, e.g. \"5\"\n")
-		fmt.Fprintf(os.Stderr, "  A-B    an inclusive range, e.g. \"1-9\"\n")
-		fmt.Fprintf(os.Stderr, "  A..B   same as A-B, e.g. \"1..9\"\n")
-		fmt.Fprintf(os.Stderr, "  A-     from A to the end of the queue, e.g. \"9-\"\n")
+		fmt.Fprintf(os.Stderr, "  N         a single queue position, e.g. \"5\"\n")
+		fmt.Fprintf(os.Stderr, "  A-B       an inclusive range, e.g. \"1-9\"\n")
+		fmt.Fprintf(os.Stderr, "  A..B      same as A-B, e.g. \"1..9\"\n")
+		fmt.Fprintf(os.Stderr, "  A-        from A to the end of the queue, e.g. \"9-\"\n")
+		fmt.Fprintf(os.Stderr, "  @word...  every track matching a '%s find'-style search, e.g. \"@amazing grace\"\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nAn @pattern selector matching more than one track requires -y/--yes\n")
+		fmt.Fprintf(os.Stderr, "to confirm removing all of them; the matches are listed so you can\n")
+		fmt.Fprintf(os.Stderr, "check before re-running with -y. Plain number/range selectors never\n")
+		fmt.Fprintf(os.Stderr, "require -y, however many are given.\n")
 		fmt.Fprintf(os.Stderr, "\nMultiple selectors may be given at once, e.g.:\n")
 		fmt.Fprintf(os.Stderr, "  %s remove 1 5 9\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s remove 1-9\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s remove -y @amazing\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
 		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n\n")
 		fs.PrintDefaults()
 	}
 
 	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	var yes bool
+	fs.BoolVar(&yes, "yes", false, "don't require confirmation when an @pattern selector matches multiple tracks")
+	fs.BoolVar(&yes, "y", false, "shorthand for --yes")
 	fs.Parse(args)
 
 	requireIP(fs, *ip)
@@ -2090,29 +2142,17 @@ func runRemove(args []string) {
 		os.Exit(1)
 	}
 
-	selected := map[int]bool{}
-	for _, arg := range fs.Args() {
-		start, end, err := parseTrackRange(arg, total)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: invalid selector %q: %v\n", arg, err)
-			os.Exit(2)
-		}
-		if start < 1 || end > total || start > end {
-			fmt.Fprintf(os.Stderr, "error: selector %q is out of range (queue has %d track(s))\n", arg, total)
-			os.Exit(2)
-		}
-		for i := start; i <= end; i++ {
-			selected[i] = true
-		}
+	indices, patternHits, err := resolveSelectors(fs.Args(), tracks)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
 	}
 
-	indices := make([]int, 0, len(selected))
-	for i := range selected {
-		indices = append(indices, i)
-	}
-	sort.Ints(indices)
+	matched, pos, _ := currentQueuePosition(*ip, tracks)
+	confirmMultiMatchOrExit(patternHits, yes, tracks, matched, pos, "remove")
 
 	// Show what's about to be removed before touching the queue.
+	// indices is already sorted ascending by resolveSelectors.
 	for _, i := range indices {
 		fmt.Printf("removing %3d. %s\n", i, formatTrack(tracks[i-1]))
 	}
