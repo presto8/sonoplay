@@ -10,6 +10,8 @@
 //	sonoplay toggle      [--ip <ip>]
 //	sonoplay list        [--ip <ip>]
 //	sonoplay remove      [--ip <ip>] <selector> [<selector> ...]
+//	sonoplay find        [--ip <ip>] <word> [<word> ...]
+//	sonoplay bump        [--ip <ip>] <selector> [<selector> ...]
 //
 // For backward compatibility, if the first argument isn't a known
 // subcommand, it's treated as `play <args...>`, e.g.:
@@ -2091,6 +2093,92 @@ func nowPlayingSuffix(pos positionInfo) string {
 	return suffix
 }
 
+// runFind implements "find"/"f": search the queue by title/artist/album/
+// file name and print the matching rows, in queue order.
+func runFind(args []string) {
+	fs := flag.NewFlagSet("find", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s find [--ip <speaker-ip>] [-n|--numbers-only] <word> [<word> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSearches the current play queue for tracks whose title, artist,\n")
+		fmt.Fprintf(os.Stderr, "album, or file name contains every given word, case-insensitively\n")
+		fmt.Fprintf(os.Stderr, "(an AND match; word order and which field each word matches don't\n")
+		fmt.Fprintf(os.Stderr, "matter). Matching rows are printed in queue order, e.g.:\n")
+		fmt.Fprintf(os.Stderr, "  %s find amazing grace\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nWith -n/--numbers-only, only the matching 1-based queue positions\n")
+		fmt.Fprintf(os.Stderr, "are printed, one per line, with no other output - handy for scripting,\n")
+		fmt.Fprintf(os.Stderr, "e.g.:\n")
+		fmt.Fprintf(os.Stderr, "  %s rm $(%s find -n foo)\n", os.Args[0], os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nExits 1 if nothing matches (like grep), so the result is scriptable.\n")
+		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
+		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n\n")
+		fs.PrintDefaults()
+	}
+
+	ip := fs.String("ip", firstNonEmpty(os.Getenv("SONOS_SPEAKER_IP"), cfg.IP), "speaker IP address")
+	var numbersOnly bool
+	fs.BoolVar(&numbersOnly, "numbers-only", false, "print only the matching 1-based positions, one per line")
+	fs.BoolVar(&numbersOnly, "n", false, "shorthand for --numbers-only")
+	fs.Parse(args)
+
+	requireIP(fs, *ip)
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
+	words := fs.Args()
+
+	// See what's currently loaded, if anything, so a match that happens
+	// to also be the now-playing track gets the "▶" marker and elapsed
+	// time suffix (same pattern as runList).
+	var pos positionInfo
+	var havePos bool
+	if state, err := getTransportState(*ip); err == nil {
+		switch state {
+		case "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING":
+			if p, err := getPositionInfo(*ip); err == nil {
+				pos = p
+				havePos = true
+				if state == "PAUSED_PLAYBACK" {
+					pos.paused = true
+				}
+			}
+		}
+	}
+
+	tracks, _, err := browseQueue(*ip, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+
+	matched := -1
+	if havePos && pos.TrackURI != "" {
+		for i, t := range tracks {
+			if t.URI == pos.TrackURI {
+				matched = i
+				break
+			}
+		}
+	}
+
+	positions := matchQueue(tracks, words)
+	if len(positions) == 0 {
+		if !numbersOnly {
+			fmt.Println("no tracks match:", strings.Join(words, " "))
+		}
+		os.Exit(1)
+	}
+
+	for _, p := range positions {
+		if numbersOnly {
+			fmt.Println(p)
+			continue
+		}
+		fmt.Println(formatQueueRow(p, tracks[p-1], p-1 == matched, pos))
+	}
+}
+
 func runStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	fs.Usage = func() {
@@ -2217,6 +2305,7 @@ func printTopUsage() {
 		{"mute-off", "unmute the speaker"},
 		{"list, ls", "list the current play queue (-a/--all for the full list)"},
 		{"remove, rm", "remove tracks from the play queue (e.g. \"rm 1 5 9\", \"rm 1-9\")"},
+		{"find, f", "search the queue by title/artist/album/file name"},
 		{"status", "show transport state, volume, and now playing"},
 		{"next, n", "skip to the next track"},
 		{"prev, previous, p", "skip to the previous track"},
@@ -2259,6 +2348,8 @@ func main() {
 		runList(os.Args[2:])
 	case "remove", "rm":
 		runRemove(os.Args[2:])
+	case "find", "f":
+		runFind(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	case "next", "n":
