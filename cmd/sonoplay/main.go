@@ -42,9 +42,11 @@
 //     dest_dir = /srv/www/sonos
 //     step = 2
 //
-// like/unlike/likes store liked songs in a SQLite database, whose path
-// can likewise be set via --db, SONOS_LIKES_DB, or a likes_db config
-// key; see likesDBPath for the default location.
+// like/unlike/likes (and watch/history) share a SQLite database, whose
+// path can likewise be set via --db, SONOS_DB, or a db config key
+// (SONOS_LIKES_DB/likes_db also still work, for backward compatibility
+// with versions of sonoplay that only had likes); see dbPath for the
+// default location.
 //
 // Playing a Spotify share link (see below) additionally needs
 // spotify_account and spotify_sn (or SONOS_SPOTIFY_ACCOUNT/SONOS_SPOTIFY_SN),
@@ -139,8 +141,12 @@ type appConfig struct {
 	SpotifyAccount string
 	SpotifySN      string
 
-	// LikesDB overrides the path to the SQLite database used by
-	// like/unlike/likes (see likesDBPath).
+	// DB overrides the path to sonoplay's SQLite database, used by
+	// like/unlike/likes and watch/history (see dbPath). LikesDB is the
+	// older, likes-only name for the same setting, kept as a fallback
+	// for existing config files from before the database also held play
+	// history.
+	DB      string
 	LikesDB string
 }
 
@@ -200,6 +206,7 @@ func loadConfig() (appConfig, error) {
 	cfg.Step = values["step"]
 	cfg.SpotifyAccount = values["spotify_account"]
 	cfg.SpotifySN = values["spotify_sn"]
+	cfg.DB = values["db"]
 	cfg.LikesDB = values["likes_db"]
 	return cfg, nil
 }
@@ -2816,19 +2823,20 @@ func resolveLikeTargets(ip string, args []string, yes bool, verb string) []likeT
 	return buildLikeTargets(positions, tracks)
 }
 
-// openLikesDBOrExit resolves dbFlagValue (the --db flag) to a path (see
-// likesDBPath) and opens it (see openLikesDB), printing a clear error
-// and exiting 1 on failure at either step. Shared by runLike, runUnlike,
-// and runLikes.
-func openLikesDBOrExit(dbFlagValue string) *sql.DB {
-	path, err := likesDBPath(dbFlagValue)
+// openDBOrExit resolves dbFlagValue (the --db flag) to a path (see
+// dbPath) and opens it (see openDB), printing a clear error and exiting
+// 1 on failure at either step. Shared by runLike, runUnlike, runLikes,
+// and (once wired up) runWatch/runHistory - anything touching the
+// shared likes/play-history database.
+func openDBOrExit(dbFlagValue string) *sql.DB {
+	path, isDefault, err := dbPath(dbFlagValue)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: open likes database:", err)
+		fmt.Fprintln(os.Stderr, "error: open database:", err)
 		os.Exit(1)
 	}
-	db, err := openLikesDB(path)
+	db, err := openDB(path, isDefault)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: open likes database:", err)
+		fmt.Fprintln(os.Stderr, "error: open database:", err)
 		os.Exit(1)
 	}
 	return db
@@ -2866,7 +2874,7 @@ func runLike(args []string) {
 		fmt.Fprintf(os.Stderr, "correctly with '%s likes --play'.\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
 		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n")
-		fmt.Fprintf(os.Stderr, "  --db  SONOS_LIKES_DB    likes_db\n\n")
+		fmt.Fprintf(os.Stderr, "  --db  SONOS_DB          db\n\n")
 		fs.PrintDefaults()
 	}
 
@@ -2879,7 +2887,7 @@ func runLike(args []string) {
 
 	requireIP(fs, *ip)
 
-	db := openLikesDBOrExit(*dbFlag)
+	db := openDBOrExit(*dbFlag)
 	defer db.Close()
 
 	targets := resolveLikeTargets(*ip, fs.Args(), yes, "like")
@@ -2932,7 +2940,7 @@ func runUnlike(args []string) {
 		fmt.Fprintf(os.Stderr, "\nUnliking a song that was never liked is reported, not an error.\n")
 		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
 		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip\n")
-		fmt.Fprintf(os.Stderr, "  --db  SONOS_LIKES_DB    likes_db\n\n")
+		fmt.Fprintf(os.Stderr, "  --db  SONOS_DB          db\n\n")
 		fs.PrintDefaults()
 	}
 
@@ -2945,7 +2953,7 @@ func runUnlike(args []string) {
 
 	requireIP(fs, *ip)
 
-	db := openLikesDBOrExit(*dbFlag)
+	db := openDBOrExit(*dbFlag)
 	defer db.Close()
 
 	targets := resolveLikeTargets(*ip, fs.Args(), yes, "unlike")
@@ -3030,7 +3038,7 @@ func runLikes(args []string) {
 		fmt.Fprintf(os.Stderr, "  %s likes --play\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
 		fmt.Fprintf(os.Stderr, "  --ip  SONOS_SPEAKER_IP  ip        (only used with --play)\n")
-		fmt.Fprintf(os.Stderr, "  --db  SONOS_LIKES_DB    likes_db\n\n")
+		fmt.Fprintf(os.Stderr, "  --db  SONOS_DB          db\n\n")
 		fs.PrintDefaults()
 	}
 
@@ -3055,7 +3063,7 @@ func runLikes(args []string) {
 		os.Exit(2)
 	}
 
-	db := openLikesDBOrExit(*dbFlag)
+	db := openDBOrExit(*dbFlag)
 	defer db.Close()
 
 	switch {
