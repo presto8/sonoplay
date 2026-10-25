@@ -433,6 +433,114 @@ func TestAmbiguousPatternHits(t *testing.T) {
 	}
 }
 
+func TestTrackKey(t *testing.T) {
+	cases := []struct {
+		name string
+		t    queueTrack
+		want string
+	}{
+		{"prefers ID when present", queueTrack{ID: "Q:0/3", URI: "http://host/a.mp3"}, "Q:0/3"},
+		{"falls back to URI when ID is empty", queueTrack{URI: "http://host/a.mp3"}, "http://host/a.mp3"},
+		{"both empty yields empty", queueTrack{}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := trackKey(c.t); got != c.want {
+				t.Errorf("trackKey(%+v) = %q, want %q", c.t, got, c.want)
+			}
+		})
+	}
+}
+
+func TestFindTrackPosition(t *testing.T) {
+	tracks := []queueTrack{
+		{ID: "Q:0/1", URI: "http://host/a.mp3"},
+		{ID: "Q:0/2", URI: "http://host/b.mp3"},
+		{URI: "http://host/a.mp3"}, // duplicate URI, no ID - distinguishable from track 1 only by ID
+	}
+
+	cases := []struct {
+		name    string
+		key     string
+		wantPos int
+		wantOK  bool
+	}{
+		{"finds by ID", "Q:0/2", 2, true},
+		{"finds by URI when the matching track has no ID (unambiguous here since track 1's trackKey is its ID, not this URI)", "http://host/a.mp3", 3, true},
+		{"missing key", "Q:0/99", -1, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pos, ok := findTrackPosition(tracks, c.key)
+			if pos != c.wantPos || ok != c.wantOK {
+				t.Errorf("findTrackPosition(_, %q) = (%d, %v), want (%d, %v)", c.key, pos, ok, c.wantPos, c.wantOK)
+			}
+		})
+	}
+}
+
+func TestBumpTargets(t *testing.T) {
+	tracks := []queueTrack{
+		{ID: "Q:0/1", URI: "u1"},
+		{ID: "Q:0/2", URI: "u2"},
+		{ID: "Q:0/3", URI: "u3"},
+		{ID: "Q:0/4", URI: "u4"},
+	}
+
+	cases := []struct {
+		name            string
+		selected        []int
+		currentPosition int
+		wantTargets     []string
+		wantDropped     int
+	}{
+		{
+			name:            "no overlap with current",
+			selected:        []int{1, 4},
+			currentPosition: 2,
+			wantTargets:     []string{"Q:0/1", "Q:0/4"},
+			wantDropped:     0,
+		},
+		{
+			name:            "current position is dropped, preserving order of the rest",
+			selected:        []int{1, 2, 4},
+			currentPosition: 2,
+			wantTargets:     []string{"Q:0/1", "Q:0/4"},
+			wantDropped:     1,
+		},
+		{
+			name:            "only the current position selected yields no targets",
+			selected:        []int{3},
+			currentPosition: 3,
+			wantTargets:     nil,
+			wantDropped:     1,
+		},
+		{
+			name:            "empty selection",
+			selected:        nil,
+			currentPosition: 2,
+			wantTargets:     nil,
+			wantDropped:     0,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			targets, dropped := bumpTargets(c.selected, c.currentPosition, tracks)
+			if len(targets) != len(c.wantTargets) {
+				t.Fatalf("bumpTargets(%v, %d) targets = %v, want %v", c.selected, c.currentPosition, targets, c.wantTargets)
+			}
+			for i := range targets {
+				if targets[i] != c.wantTargets[i] {
+					t.Errorf("bumpTargets(%v, %d) targets[%d] = %q, want %q", c.selected, c.currentPosition, i, targets[i], c.wantTargets[i])
+				}
+			}
+			if dropped != c.wantDropped {
+				t.Errorf("bumpTargets(%v, %d) dropped = %d, want %d", c.selected, c.currentPosition, dropped, c.wantDropped)
+			}
+		})
+	}
+}
+
 func TestTerminalSafetyMargin(t *testing.T) {
 	cases := []struct {
 		rows int
