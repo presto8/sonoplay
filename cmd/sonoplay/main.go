@@ -1694,11 +1694,12 @@ func classifyPlayArgs(args []string) (selector, mixed bool) {
 func runPlay(args []string) {
 	fs := flag.NewFlagSet("play", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s play [--ip <speaker-ip>] [--base-url <url>] [--dest-dir <dir>] [--now] <file-path-or-url-or-queue-position> [<file-path-or-url> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s play [--ip <speaker-ip>] [--base-url <url>] [--dest-dir <dir>] [--db <path>] [--now] <file-path-or-url-or-queue-position> [<file-path-or-url> ...]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nEach option falls back, in order: flag > env var > config file:\n")
 		fmt.Fprintf(os.Stderr, "  --ip        SONOS_SPEAKER_IP   ip\n")
 		fmt.Fprintf(os.Stderr, "  --base-url  SONOS_BASE_URL     base_url\n")
 		fmt.Fprintf(os.Stderr, "  --dest-dir  SONOS_DEST_DIR     dest_dir\n")
+		fmt.Fprintf(os.Stderr, "  --db        SONOS_DB           db\n")
 		fmt.Fprintf(os.Stderr, "\nIf a single argument is a plain positive number (e.g. \"3\"), it's\n")
 		fmt.Fprintf(os.Stderr, "treated as a 1-based position in the current queue (see '%s list'):\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "the speaker switches to its queue, jumps to that item, and plays it\n")
@@ -1734,7 +1735,13 @@ func runPlay(args []string) {
 		fmt.Fprintf(os.Stderr, "of the newly queued tracks.\n")
 		fmt.Fprintf(os.Stderr, "\nAny argument that can't be resolved into something playable (e.g. a\n")
 		fmt.Fprintf(os.Stderr, ".jpg, or a local file with no audio stream) is skipped with a message\n")
-		fmt.Fprintf(os.Stderr, "instead of aborting the rest.\n\n")
+		fmt.Fprintf(os.Stderr, "instead of aborting the rest.\n")
+		fmt.Fprintf(os.Stderr, "\nA single song that actually starts playing now - by file/URL, queue\n")
+		fmt.Fprintf(os.Stderr, "position/selector, or a single Spotify track link - is recorded in\n")
+		fmt.Fprintf(os.Stderr, "play history (see '%s history -h'). Several files/URLs, a Spotify\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "album/playlist/show/artist link, and anything merely queued (not\n")
+		fmt.Fprintf(os.Stderr, "played immediately) are NOT recorded - only a single song you\n")
+		fmt.Fprintf(os.Stderr, "deliberately start playing right now counts.\n\n")
 		fs.PrintDefaults()
 	}
 
@@ -1743,6 +1750,7 @@ func runPlay(args []string) {
 	destDir := fs.String("dest-dir", firstNonEmpty(os.Getenv("SONOS_DEST_DIR"), cfg.DestDir), "local directory to copy the source file into before playing it")
 	now := fs.Bool("now", false, "play immediately, interrupting current playback, instead of enqueuing")
 	first := fs.Bool("first", false, "with an @pattern argument matching multiple tracks, play the first match instead of erroring")
+	dbFlag := fs.String("db", "", "override the play-history database path")
 	fs.Parse(args)
 
 	requireIP(fs, *ip)
@@ -1792,6 +1800,8 @@ func runPlay(args []string) {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+		t := tracks[index-1]
+		recordExplicitPlay(*dbFlag, t.URI, t.Title, t.Artist, t.Album)
 		if pos, err := getPositionInfo(*ip); err == nil {
 			track, _ := parseDIDLItem(pos.TrackMetaData)
 			if track.Title == "" && track.URI == "" {
@@ -1878,6 +1888,8 @@ func runPlay(args []string) {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+		title, artist, album := nowPlayingMetadata(*ip)
+		recordExplicitPlay(*dbFlag, uri, title, artist, album)
 		return
 	}
 
@@ -1920,7 +1932,68 @@ func runPlay(args []string) {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+	if isSingleSpotifyTrack(items) {
+		title, artist, album := nowPlayingMetadata(*ip)
+		recordExplicitPlay(*dbFlag, items[0].URI, title, artist, album)
+	}
 	fmt.Printf("queued %d tracks and started playing from item %d\n", queuedCount, firstTrackNumber)
+}
+
+// isSingleSpotifyTrack reports whether items is exactly one playItem
+// resolved from a Spotify TRACK share link, as opposed to an album,
+// playlist, episode, show, or artist link - see resolveSpotifyItem's
+// Label, which always has the form "spotify <shareType> <id>", so a
+// track link's Label always starts with "spotify track ".
+func isSingleSpotifyTrack(items []playItem) bool {
+	return len(items) == 1 && strings.HasPrefix(items[0].Label, "spotify track ")
+}
+
+// nowPlayingMetadata best-effort reads the title/artist/album of
+// whatever the speaker is currently playing, for recordExplicitPlay to
+// attach to a play history row right after starting something whose
+// metadata wasn't already known locally (e.g. a plain file/URL, which
+// resolvePlayURL never attaches tags to). Returns zero values (not an
+// error) if this can't be determined - a play with just a URI and no
+// metadata is still useful history, so this is never treated as fatal.
+func nowPlayingMetadata(ip string) (title, artist, album string) {
+	pos, err := getPositionInfo(ip)
+	if err != nil {
+		return "", "", ""
+	}
+	track, _ := parseDIDLItem(pos.TrackMetaData)
+	return track.Title, track.Artist, track.Album
+}
+
+// recordExplicitPlay best-effort records uri (with title/artist/album,
+// any of which may be empty if unknown) as an explicitly-started play
+// in the play-history database (see recordPlay in history.go), using
+// dbFlagValue (a command's --db flag). Called only at the specific
+// points in runPlay where a single song has just started playing right
+// now (not merely been added to the queue) - see runPlay's usage text
+// for exactly which cases that covers.
+//
+// Failures here are reported as a warning, not a fatal error:
+// playback has already started successfully by the time this is
+// called, so losing a history row is far less bad than failing an
+// otherwise-successful play command over it.
+func recordExplicitPlay(dbFlagValue, uri, title, artist, album string) {
+	if uri == "" {
+		return
+	}
+	path, isDefault, err := dbPath(dbFlagValue)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: couldn't record play history:", err)
+		return
+	}
+	db, err := openDB(path, isDefault)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: couldn't record play history:", err)
+		return
+	}
+	defer db.Close()
+	if err := recordPlay(db, time.Now(), uri, title, artist, album); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: couldn't record play history:", err)
+	}
 }
 
 func runVolume(name string, args []string, sign int) {
