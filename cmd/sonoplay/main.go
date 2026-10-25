@@ -693,6 +693,124 @@ func formatTrack(t queueTrack) string {
 	}
 }
 
+// trackFileName extracts the file name portion of a track's URI, for
+// matching against tracks whose only identifying text is their file name
+// (common for local files played with no, or minimal, metadata). The URI
+// is treated as a slash-separated path (true of both local file paths and
+// HTTP(S) URLs) and the last segment is percent-decoded, e.g.
+// "http://host/Amazing%20Grace.mp3" yields "Amazing Grace.mp3". If decoding
+// fails, the raw (still-encoded) segment is returned rather than an error,
+// since this is only ever used for a case-insensitive substring match.
+func trackFileName(uri string) string {
+	name := uri
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:]
+	}
+	if decoded, err := url.PathUnescape(name); err == nil {
+		name = decoded
+	}
+	return name
+}
+
+// trackMatches reports whether every word in words is found, as a
+// case-insensitive substring, somewhere in t's title, artist, album, or
+// the file name portion of its URI (see trackFileName). Word order and
+// which field each word matches don't matter: "amazing grace" matches a
+// track titled "Grace, Amazing" just as readily as "Amazing Grace". An empty
+// words list matches nothing (callers should treat that as a usage
+// error, not "match everything").
+func trackMatches(t queueTrack, words []string) bool {
+	if len(words) == 0 {
+		return false
+	}
+	haystack := strings.ToLower(strings.Join([]string{t.Title, t.Artist, t.Album, trackFileName(t.URI)}, "\x00"))
+	for _, w := range words {
+		if w == "" {
+			continue
+		}
+		if !strings.Contains(haystack, strings.ToLower(w)) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchQueue returns the 1-based positions, in queue order, of every
+// track in tracks matching trackMatches(_, words).
+func matchQueue(tracks []queueTrack, words []string) []int {
+	var positions []int
+	for i, t := range tracks {
+		if trackMatches(t, words) {
+			positions = append(positions, i+1)
+		}
+	}
+	return positions
+}
+
+// selectorPatternPrefix marks a queue-search selector, e.g. "@amazing
+// zero", as accepted by resolveSelectors alongside plain-number and range
+// selectors (see parseTrackRange). The word(s) after the prefix are
+// matched per trackMatches.
+const selectorPatternPrefix = "@"
+
+// resolvePatternHit records how many tracks a single "@..." selector
+// matched, so callers can decide whether multiple matches need extra
+// confirmation (e.g. remove's -y flag).
+type resolvePatternHit struct {
+	pattern   string
+	positions []int
+}
+
+// resolveSelectors parses a mix of position/range selectors (see
+// parseTrackRange: "5", "1-9", "1..9", "9-") and "@word..." search
+// selectors against tracks, returning every matching 1-based position,
+// sorted ascending with duplicates removed. patternHits reports, for each
+// "@..." selector given (in the order given), which positions it matched;
+// callers that want to require confirmation for a pattern matching more
+// than one track can inspect this. An "@..." selector matching no tracks,
+// or any selector with invalid syntax or an out-of-range position, is an
+// error - in neither case is a partial result returned.
+func resolveSelectors(args []string, tracks []queueTrack) (positions []int, patternHits []resolvePatternHit, err error) {
+	total := len(tracks)
+	selected := map[int]bool{}
+
+	for _, arg := range args {
+		if pattern, ok := strings.CutPrefix(arg, selectorPatternPrefix); ok {
+			words := strings.Fields(pattern)
+			if len(words) == 0 {
+				return nil, nil, fmt.Errorf("empty search pattern %q", arg)
+			}
+			hits := matchQueue(tracks, words)
+			if len(hits) == 0 {
+				return nil, nil, fmt.Errorf("%q matched no tracks in the queue", arg)
+			}
+			patternHits = append(patternHits, resolvePatternHit{pattern: pattern, positions: hits})
+			for _, i := range hits {
+				selected[i] = true
+			}
+			continue
+		}
+
+		start, end, err := parseTrackRange(arg, total)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid selector %q: %w", arg, err)
+		}
+		if start < 1 || end > total || start > end {
+			return nil, nil, fmt.Errorf("selector %q is out of range (queue has %d track(s))", arg, total)
+		}
+		for i := start; i <= end; i++ {
+			selected[i] = true
+		}
+	}
+
+	positions = make([]int, 0, len(selected))
+	for i := range selected {
+		positions = append(positions, i)
+	}
+	sort.Ints(positions)
+	return positions, patternHits, nil
+}
+
 // setRelativeVolume adjusts the volume by adjustment (can be negative) and
 // returns the speaker's new volume (0-100).
 func setRelativeVolume(ip string, adjustment int) (int, error) {
@@ -1743,6 +1861,20 @@ func visibleWindow(total, anchor, maxLines int) (start, end int, topEllipsis, bo
 	return start, end, true, true
 }
 
+// formatQueueRow renders a single queue listing row, 1-based position i,
+// in the shared format used by both "list" and "find": "  12. Artist -
+// Title (Album)", or "▶  12. ..." plus the elapsed/duration suffix (see
+// nowPlayingSuffix) when isPlaying is true.
+func formatQueueRow(i int, t queueTrack, isPlaying bool, pos positionInfo) string {
+	marker := "  "
+	suffix := ""
+	if isPlaying {
+		marker = "▶ "
+		suffix = nowPlayingSuffix(pos)
+	}
+	return fmt.Sprintf("%s%3d. %s%s", marker, i, formatTrack(t), suffix)
+}
+
 func runList(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	fs.Usage = func() {
@@ -1838,14 +1970,7 @@ func runList(args []string) {
 		fmt.Printf("... %d before\n", start)
 	}
 	for i := start; i < end; i++ {
-		t := tracks[i]
-		marker := "  "
-		suffix := ""
-		if i == matched {
-			marker = "▶ "
-			suffix = nowPlayingSuffix(pos)
-		}
-		fmt.Printf("%s%3d. %s%s\n", marker, i+1, formatTrack(t), suffix)
+		fmt.Println(formatQueueRow(i+1, tracks[i], i == matched, pos))
 	}
 	if bottomEllipsis {
 		fmt.Printf("... %d more\n", len(tracks)-end)
