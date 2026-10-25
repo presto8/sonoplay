@@ -1,6 +1,6 @@
 # sonoplay
 
-A minimal Sonos control CLI. Pure Go stdlib, no cgo. It talks directly to
+A minimal Sonos control CLI. Pure Go, no cgo. It talks directly to
 a Sonos speaker's local UPnP/SOAP API, so basic playback and queue
 control work without a cloud account.
 
@@ -45,6 +45,12 @@ step = 2
   before handing them to the speaker, if set
 - `step` - default volume step size used by `volume-up`/`volume-down`
 
+`like`/`unlike`/`likes` store liked songs in a separate SQLite database
+(see [Liked songs](#liked-songs) below), whose path follows the same
+precedence: `--db`, then `SONOS_LIKES_DB`, then a `likes_db` config key,
+falling back to `$XDG_DATA_HOME/sonoplay/likes.db`
+(`~/.local/share/sonoplay/likes.db` if `$XDG_DATA_HOME` is unset).
+
 ## Commands
 
 | Command | Description |
@@ -59,6 +65,9 @@ step = 2
 | `find`, `f` | search the queue by title/artist/album/file name |
 | `remove`, `rm` | remove tracks from the play queue (e.g. `rm 1 5 9`, `rm 1-9`, `rm @amazing`) |
 | `bump`, `up-next` | move matched/selected tracks to play right after the current track |
+| `like` | like the current track, or matched/selected queue tracks |
+| `unlike` | remove the current or matched/selected tracks from likes |
+| `likes` | list liked songs (`--play` to queue/play them all) |
 | `status`, `s` | show transport state, volume, and now playing |
 | `next`, `n` | skip to the next track |
 | `prev`, `previous`, `p` | skip to the previous track |
@@ -98,6 +107,38 @@ If `@pattern` matches more than one track, `play` requires `--first` to
 pick the first match, and `remove`/`bump` require `-y`/`--yes` to confirm
 acting on all of them; otherwise the matches are listed and nothing is
 changed.
+
+## Liked songs
+
+`like` records a song in a persistent SQLite database, separate from
+(and surviving) the speaker's play queue. With no arguments, it likes
+whatever is currently playing; with a selector (same syntax as
+`remove`/`bump`), it likes matched/selected tracks in the queue instead:
+
+```
+sonoplay like
+sonoplay like 5
+sonoplay like @amazing
+```
+
+Liking an already-liked song adds another like event rather than
+erroring or no-op'ing - it's a history, not a toggle:
+
+```
+sonoplay likes            # one row per song, with its total like count
+sonoplay likes --history  # every like event, newest first
+```
+
+`unlike` removes a song from likes entirely (all of its like history, not
+just the most recent event), using the same no-args/selector rules as
+`like`. `likes --play` queues every liked song and starts playing them
+(appending without interrupting playback unless `--now` is given, or
+nothing is currently playing).
+
+Liked tracks are replayed by their bare URL/file; this works for ordinary
+files and streams, but special per-service metadata (e.g. Spotify) isn't
+preserved, so such liked tracks may not replay correctly with
+`likes --play`.
 
 ## Spotify share links
 
