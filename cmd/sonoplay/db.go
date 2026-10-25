@@ -196,22 +196,20 @@ CREATE INDEX IF NOT EXISTS likes_uri ON likes(uri);
 	return err
 }
 
-// migrateToV2 creates the plays table (play history, added alongside
-// the sonoplay.db rename). Existing likes data is untouched.
+// migrateToV2 creates the plays table (play history: one row per song
+// the user explicitly started playing - see history.go and runPlay's
+// recordPlay calls). Existing likes data is untouched.
 func migrateToV2(db *sql.DB) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS plays (
-	id               INTEGER PRIMARY KEY,
-	started_at       TEXT NOT NULL,
-	last_seen_at     TEXT NOT NULL,
-	listened_seconds INTEGER NOT NULL DEFAULT 0,
-	duration_seconds INTEGER,
-	uri              TEXT NOT NULL,
-	title            TEXT NOT NULL DEFAULT '',
-	artist           TEXT NOT NULL DEFAULT '',
-	album            TEXT NOT NULL DEFAULT ''
+	id        INTEGER PRIMARY KEY,
+	played_at TEXT NOT NULL,
+	uri       TEXT NOT NULL,
+	title     TEXT NOT NULL DEFAULT '',
+	artist    TEXT NOT NULL DEFAULT '',
+	album     TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS plays_started_at ON plays(started_at);
+CREATE INDEX IF NOT EXISTS plays_played_at ON plays(played_at);
 CREATE INDEX IF NOT EXISTS plays_uri ON plays(uri);
 `
 	_, err := db.Exec(schema)

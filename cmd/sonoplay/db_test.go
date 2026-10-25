@@ -169,8 +169,8 @@ func TestMigrateDBFreshDatabaseReachesCurrentVersionWithBothTables(t *testing.T)
 	if err := addLike(db, "http://host/a.mp3", "A", "Artist", "Album"); err != nil {
 		t.Errorf("addLike on a fresh db: %v", err)
 	}
-	if _, err := startPlay(db, time.Now().UTC(), "http://host/a.mp3", "A", "Artist", "Album", 0); err != nil {
-		t.Errorf("startPlay on a fresh db: %v", err)
+	if err := recordPlay(db, time.Now().UTC(), "http://host/a.mp3", "A", "Artist", "Album"); err != nil {
+		t.Errorf("recordPlay on a fresh db: %v", err)
 	}
 }
 
@@ -234,8 +234,8 @@ func TestMigrateDBFromV1PreservesExistingLikes(t *testing.T) {
 	}
 
 	// And the plays table must now exist and be usable.
-	if _, err := startPlay(db, time.Now().UTC(), "http://host/c.mp3", "C", "", "", 0); err != nil {
-		t.Errorf("startPlay after migration: %v", err)
+	if err := recordPlay(db, time.Now().UTC(), "http://host/c.mp3", "C", "", ""); err != nil {
+		t.Errorf("recordPlay after migration: %v", err)
 	}
 }
 
@@ -432,8 +432,8 @@ func TestOpenDBRenamesOldLikesDBAndPreservesData(t *testing.T) {
 	if version != currentSchemaVersion {
 		t.Errorf("user_version after rename+migration = %d, want %d", version, currentSchemaVersion)
 	}
-	if _, err := startPlay(db, time.Now().UTC(), "http://host/b.mp3", "B", "", "", 0); err != nil {
-		t.Errorf("startPlay after rename+migration: %v", err)
+	if err := recordPlay(db, time.Now().UTC(), "http://host/b.mp3", "B", "", ""); err != nil {
+		t.Errorf("recordPlay after rename+migration: %v", err)
 	}
 }
 
