@@ -1,4 +1,4 @@
-// sonoplay - minimal Sonos control tool, pure Go stdlib, no cgo.
+// sonoplay - minimal Sonos control tool, pure Go, no cgo.
 //
 // Subcommands:
 //
@@ -12,6 +12,9 @@
 //	sonoplay remove      [--ip <ip>] <selector> [<selector> ...]
 //	sonoplay find        [--ip <ip>] <word> [<word> ...]
 //	sonoplay bump        [--ip <ip>] <selector> [<selector> ...]
+//	sonoplay like        [--ip <ip>] [--db <path>] [<selector> ...]
+//	sonoplay unlike      [--ip <ip>] [--db <path>] [<selector> ...]
+//	sonoplay likes       [--db <path>]
 //
 // For backward compatibility, if the first argument isn't a known
 // subcommand, it's treated as `play <args...>`, e.g.:
@@ -38,6 +41,10 @@
 //     base_url = http://myhost/
 //     dest_dir = /srv/www/sonos
 //     step = 2
+//
+// like/unlike/likes store liked songs in a SQLite database, whose path
+// can likewise be set via --db, SONOS_LIKES_DB, or a likes_db config
+// key; see likesDBPath for the default location.
 //
 // Playing a Spotify share link (see below) additionally needs
 // spotify_account and spotify_sn (or SONOS_SPOTIFY_ACCOUNT/SONOS_SPOTIFY_SN),
@@ -130,6 +137,10 @@ type appConfig struct {
 	// Sonos Favorites or played on this system).
 	SpotifyAccount string
 	SpotifySN      string
+
+	// LikesDB overrides the path to the SQLite database used by
+	// like/unlike/likes (see likesDBPath).
+	LikesDB string
 }
 
 // cfg is populated once at startup from the config file, then used as a
@@ -188,6 +199,7 @@ func loadConfig() (appConfig, error) {
 	cfg.Step = values["step"]
 	cfg.SpotifyAccount = values["spotify_account"]
 	cfg.SpotifySN = values["spotify_sn"]
+	cfg.LikesDB = values["likes_db"]
 	return cfg, nil
 }
 
