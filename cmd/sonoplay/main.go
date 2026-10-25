@@ -1528,6 +1528,11 @@ func runPlay(args []string) {
 		fmt.Fprintf(os.Stderr, "treated as a 1-based position in the current queue (see '%s list'):\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "the speaker switches to its queue, jumps to that item, and plays it\n")
 		fmt.Fprintf(os.Stderr, "immediately. (Only applies with exactly one numeric argument.)\n")
+		fmt.Fprintf(os.Stderr, "\nA single argument starting with \"@\" (e.g. \"@amazing grace\") is treated\n")
+		fmt.Fprintf(os.Stderr, "the same way, but resolved by searching the queue (see '%s find') rather\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "than by position. If it matches more than one track, that's an error\n")
+		fmt.Fprintf(os.Stderr, "unless --first is given, in which case the first (lowest-positioned)\n")
+		fmt.Fprintf(os.Stderr, "match is played.\n")
 		fmt.Fprintf(os.Stderr, "\nOtherwise, each argument is resolved independently: if it contains\n")
 		fmt.Fprintf(os.Stderr, "\"://\" it's played as-is; else if --dest-dir is set it's treated as a\n")
 		fmt.Fprintf(os.Stderr, "local file path that gets copied into --dest-dir (transcoded to mp3\n")
@@ -1555,6 +1560,7 @@ func runPlay(args []string) {
 	baseURL := fs.String("base-url", firstNonEmpty(os.Getenv("SONOS_BASE_URL"), cfg.BaseURL), `base URL to prefix the file name with, e.g. "http://myhost/"`)
 	destDir := fs.String("dest-dir", firstNonEmpty(os.Getenv("SONOS_DEST_DIR"), cfg.DestDir), "local directory to copy the source file into before playing it")
 	now := fs.Bool("now", false, "play immediately, interrupting current playback, instead of enqueuing")
+	first := fs.Bool("first", false, "with an @pattern argument matching multiple tracks, play the first match instead of erroring")
 	fs.Parse(args)
 
 	requireIP(fs, *ip)
@@ -1564,9 +1570,36 @@ func runPlay(args []string) {
 		os.Exit(2)
 	}
 
-	// Single plain-number argument: jump straight to that queue position.
-	if fs.NArg() == 1 && isPositiveInteger(fs.Arg(0)) {
-		index, _ := strconv.Atoi(fs.Arg(0)) // safe: isPositiveInteger validated digits-only
+	// Single argument that's either a plain queue position (e.g. "3") or
+	// an "@pattern" search selector (e.g. "@amazing grace"): resolve it
+	// against the current queue and jump straight to the result, rather
+	// than treating it as a file/URL argument. Both forms go through
+	// resolveSelectors so there's one code path instead of two divergent
+	// ones; a bare number only ever resolves to itself (already
+	// range-checked by resolveSelectors), while "@pattern" may resolve
+	// to more than one position.
+	if fs.NArg() == 1 && (isPositiveInteger(fs.Arg(0)) || strings.HasPrefix(fs.Arg(0), selectorPatternPrefix)) {
+		tracks, _, err := browseQueue(*ip, 0)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		positions, _, err := resolveSelectors([]string{fs.Arg(0)}, tracks)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
+		index := positions[0] // lowest-positioned match; the only one unless an @pattern matched several
+		if len(positions) > 1 && !*first {
+			fmt.Fprintf(os.Stderr, "error: %q matches more than one track:\n", fs.Arg(0))
+			matched, pos, _ := currentQueuePosition(*ip, tracks)
+			for _, p := range positions {
+				fmt.Fprintln(os.Stderr, formatQueueRow(p, tracks[p-1], p-1 == matched, pos))
+			}
+			os.Exit(2)
+		}
+
 		if err := playQueueIndex(*ip, index); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
@@ -1861,6 +1894,45 @@ func visibleWindow(total, anchor, maxLines int) (start, end int, topEllipsis, bo
 		start = end - inner
 	}
 	return start, end, true, true
+}
+
+// currentQueuePosition looks up the speaker's transport state and, if
+// something is actively loaded (PLAYING/PAUSED_PLAYBACK/TRANSITIONING),
+// matches its TrackURI against tracks to find which 0-based index (if
+// any) it corresponds to in the queue - the same "what's playing, and
+// where is it in the queue" check runList uses to place its "▶" marker,
+// shared here for play's multi-match listing and bump. matched is -1 if
+// nothing is playing, or what's playing isn't part of the queue (e.g. a
+// one-off direct-played URL).
+func currentQueuePosition(ip string, tracks []queueTrack) (matched int, pos positionInfo, havePos bool) {
+	matched = -1
+	state, err := getTransportState(ip)
+	if err != nil {
+		return matched, pos, false
+	}
+	switch state {
+	case "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING":
+	default:
+		return matched, pos, false
+	}
+	p, err := getPositionInfo(ip)
+	if err != nil {
+		return matched, pos, false
+	}
+	pos = p
+	havePos = true
+	if state == "PAUSED_PLAYBACK" {
+		pos.paused = true
+	}
+	if pos.TrackURI != "" {
+		for i, t := range tracks {
+			if t.URI == pos.TrackURI {
+				matched = i
+				break
+			}
+		}
+	}
+	return matched, pos, true
 }
 
 // formatQueueRow renders a single queue listing row, 1-based position i,
